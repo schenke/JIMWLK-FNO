@@ -1,0 +1,25 @@
+On NERSC:
+sbatch make_trainig_data.slurm
+sbatch train.slurm
+module load pytorch
+python compare_predict.py   --runs /pscratch/sd/s/schenke/jimwlk_runs   --ckpt /pscratch/sd/s/schenke/outputs_evolver/evolver_best.pt   --run run_00127   --steps 40
+
+
+0) Build the binary once (outside this script)
+cd /path/to/jimwlk
+mkdir -p build && cd build && cmake .. && make -j
+# binary will be /path/to/jimwlk/build/bin/jimwlk
+
+1) Create a minimal template input (copy repo's 'input' and keep your defaults)
+cp /path/to/jimwlk/input /work/jimwlk_input_template
+
+2) Run the code to generate training data
+jimwlk_rc_lhs.py [-h] --repo REPO --bin BIN --template TEMPLATE --out OUT [--samples SAMPLES] [--seed SEED] [--omp OMP]
+python jimwlk_rc_lhs.py  --repo ./ --bin ./build/bin/jimwlk --template ./work/jimwlk_input_template --out ./work/jimwlk_runs --samples 10 --omp 4
+
+
+3) Train model:
+python train_evolver_4param.py   --data_root ./work/jimwlk_runs   --ds 0.0004   --epochs 100   --batch 1   --width 96 --modes 24 --blocks 8   --out ./work/checkpoints
+
+4) Compare and predict:
+python compare_predict.py   --runs ./work/jimwlk_runs   --ckpt ./work/checkpoints/evolver_best.pt   --ds 0.0004   --run run_00009   --steps 120
