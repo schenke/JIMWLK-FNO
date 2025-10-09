@@ -38,6 +38,49 @@ import torch, torch.distributed as dist
 def is_main():
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
+def dipole_from_links18(links18: torch.Tensor,
+                        offsets=None) -> torch.Tensor:
+    """
+    Compute a compact dipole summary N(r) for a set of lattice separations.
+
+    Args:
+        links18: (B, C>=18, H, W) with first 18 channels encoding a 3x3 complex matrix:
+                 channels [0..8] = real parts row-major, [9..17] = imag parts row-major.
+        offsets: list of (dy, dx) lattice displacements. If None, a small default set is used.
+
+    Returns:
+        N: (B, K) tensor, where K = len(offsets), each entry is the spatial average of
+           N_r = 1 - (1/Nc) Re tr[ U(x) U^\dagger(x+r) ] over the lattice.
+    """
+    x = links18[:, :18]  # (B, 18, H, W)
+    B, _, H, W = x.shape
+
+    # Unpack 18 channels -> complex 3x3 matrix per site
+    real = x[:, 0:9].reshape(B, 9, H, W).permute(0, 2, 3, 1).reshape(B, H, W, 3, 3)
+    imag = x[:, 9:18].reshape(B, 9, H, W).permute(0, 2, 3, 1).reshape(B, H, W, 3, 3)
+    U = torch.complex(real, imag)  # (B, H, W, 3, 3), complex64/complex128 depending on inputs
+
+    if offsets is None:
+        # A compact, inexpensive set of radii (tweak as you like).
+        # Includes cardinal and diagonal directions at a few distances.
+        offsets = [(0,1),(1,0),(1,1),(0,2),(2,0),(2,1),(1,2),(2,2),
+                   (0,4),(4,0),(3,4),(4,3)]
+
+    Nc = 3.0
+    out = []
+    for (dy, dx) in offsets:
+        # periodic BC via roll; negative shifts also work if you include them
+        U_shift = torch.roll(U, shifts=(dy, dx), dims=(1, 2))  # (B,H,W,3,3)
+        # U(x) U^\dagger(x+r)
+        prod = U @ U_shift.conj().transpose(-1, -2)            # (B,H,W,3,3)
+        # (1/Nc) Re tr[prod]
+        tr_re = prod.diagonal(dim1=-2, dim2=-1).sum(-1).real / Nc   # (B,H,W)
+        S = tr_re.mean(dim=(1, 2))                                  # (B,)
+        N = 1.0 - S
+        out.append(N)
+
+    return torch.stack(out, dim=1)  # (B, K)
+
 def _q4_scalar(U: torch.Tensor, dx1: int, dy1: int, dx2: int, dy2: int) -> torch.Tensor:
     """
     U: [B, H, W, 3, 3] complex
@@ -1050,7 +1093,7 @@ class SU3HeadGellMannStochastic(nn.Module):
                  noise_kernel: int | None = None,
                  #sigma_mode: str = "conv",          # "diag" (current), "conv", or "spectral"
                  #noise_kernel: int = 5,             # conv kernel for spatial coupling
-                 y_gain: float = 1.0):
+                 ):
         super().__init__()
         self.proj_mu   = nn.Conv2d(width, 8, 1)
         self.proj_logs = nn.Conv2d(width, 8, 1)
@@ -1082,7 +1125,6 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.log_cR = nn.Parameter(torch.zeros(()))
 
         # gain for mapping physical Y -> bounded y_eff in the exponent
-        self.y_gain = float(y_gain)
 
         # λ/2 basis (complex Hermitian), shared with deterministic head
         L = torch.zeros(8, 3, 3, dtype=torch.complex64)
@@ -1210,9 +1252,7 @@ class SU3HeadGellMannStochastic(nn.Module):
 
 
 
-        y_phys = Ymap[:, 0, :, :].to(mu.real.dtype)                 # [B,H,W]
-        # Expect self.y_gain ≈ 1 / (Y_max - Y_min); see model init below
-        y_eff = y_phys*self.y_gain
+        y_eff = Ymap[:, 0, :, :].to(mu.real.dtype)                 # [B,H,W]
 
         # Broadcast helpers
         y       = y_eff.unsqueeze(-1).unsqueeze(-1)  # [B,H,W,1,1]  (real)
@@ -1382,7 +1422,7 @@ class SU3HeadGellMannStochastic(nn.Module):
 
 class SU3HeadGellMann(nn.Module):
     def __init__(self, width: int, identity_eps: float = 0.0,
-                 alpha_scale: float = 1.0, clamp_alphas: float | None = None, alpha_vec_cap: float|None = 15., y_gain: float = 1.0):
+                 alpha_scale: float = 1.0, clamp_alphas: float | None = None, alpha_vec_cap: float|None = 15.):
         super().__init__()
         self.proj8 = nn.Conv2d(width, 8, 1)
         self.identity_eps = float(identity_eps)
@@ -1390,7 +1430,6 @@ class SU3HeadGellMann(nn.Module):
         self.clamp_alphas = clamp_alphas
         self.alpha_vec_cap = alpha_vec_cap
         self.last_A_fro_mean = torch.tensor(0.0)
-        self.y_gain = float(y_gain)
         
         # Complex Hermitian Gell-Mann matrices λ_a  (shape [8,3,3], complex)
         L = torch.zeros(8, 3, 3, dtype=torch.complex64)
@@ -1449,7 +1488,6 @@ class SU3HeadGellMann(nn.Module):
             # Broadcast Y: [B,1,H,W] -> [B,H,W,1,1]
 #            y = Ymap.squeeze(1).unsqueeze(-1).unsqueeze(-1).to(A.dtype)
             y = Ymap[:, 0, :, :].unsqueeze(-1).unsqueeze(-1).to(A.real.dtype)
-            y = y * self.y_gain
             # Exponentiate and apply
             G = torch.linalg.matrix_exp(-y * A)
             U = G @ U0
@@ -1486,7 +1524,6 @@ class EvolverFNO(nn.Module):
                  gamma_scale: float = 1.5,
                  beta_scale: float = 1.0,
                  gate_temp: float = 2.0,
-                 y_gain: float = 1.0,
                  y_min: float | None = None,
                  y_max: float | None = None,
                  rbf_gamma: float = 0.,
@@ -1515,10 +1552,8 @@ class EvolverFNO(nn.Module):
             alpha_scale=alpha_scale,
             clamp_alphas=clamp_alphas,
             alpha_vec_cap=alpha_vec_cap,
-            y_gain=float(y_gain)
         )
         self.head.dy_calib = DeltaYCalibrator()
-        self.head.y_gain   = float(y_gain)
 
         # Y & θ embeddings → per-block FiLM + gates
 
@@ -1622,8 +1657,7 @@ class EvolverFNO(nn.Module):
 
 
 
-        self.y_gain    = float(y_gain)
-        self.y_map     = y_map
+        self.y_map = y_map
         self.y_min = y_min
         self.y_max = y_max
         # Buffers for normalizing Y → [0,1]
@@ -1657,8 +1691,7 @@ class EvolverFNO(nn.Module):
 
         elif self.y_map == "tanh":
             # Smoothly compress large ΔY; map to [0,1]
-            # Uses y_gain as the slope; anchors 0 at y_min and 1 near y_max.
-            g = float(self.y_gain) if isinstance(self.y_gain, (int, float)) else float(self.y_gain)
+            g = 1. 
             num = torch.tanh(g * (y_scalar - y_min))
             den = torch.tanh(g * (y_max - y_min)).clamp_min(1e-9)
             y01 = (num / den).clamp(0.0, 1.0)
@@ -1698,8 +1731,6 @@ class EvolverFNO(nn.Module):
         if eY.dim() > 2:
             # collapse any stray dims (shouldn't happen, but safe)
             eY = eY.flatten(1)
-        eY = eY * self.y_gain                      # [B, KY]
-
         # theta embed -> [B, KT] (make sure it's 2-D)
         eT = self.theta_embed(theta.to(h.device, h.dtype))
         if eT.dim() > 2:
@@ -1738,58 +1769,10 @@ class EvolverFNO(nn.Module):
                 h = h + beta.view(-1, self.width, 1, 1)
 
 
-            # gamma, beta, gate = cond[i]            # expected shapes [B, W], [B, W] or None, and [B, 1] or [B, W]
-
-            # # allow scalar OR per-channel gate; upgrade scalar -> per-channel
-            # if gate.dim() == 2 and gate.shape[1] == 1:
-            #     gate = gate.expand(-1, self.width)
-            # elif gate.dim() == 1:
-            #     gate = gate[:, None].expand(-1, self.width)
-
-            # # apply channelwise
-            # h = h_in + gate.view(-1, self.width, 1, 1) * (h_b - h_in)
-            # h = h * (1.0 + gamma.view(-1, self.width, 1, 1))
-            # if beta is not None:
-            #     h = h + beta.view(-1, self.width, 1, 1)
-
-
-            # gamma, beta, gate = cond[i]            # gamma:[B,C], beta:[B,C] or None, gate:[B] or [B,1]
-            # # make broadcastable shapes (use reshape to avoid contiguity issues)
-            # gate  = gate.reshape(B, 1, 1, 1).to(h.device, h.dtype)
-            # gamma = gamma.reshape(B, C, 1, 1).to(h.device, h.dtype)
-            # h = h_in + gate * (h_b - h_in)
-            # h = h * (1.0 + gamma)
-            # if beta is not None:
-            #     beta = beta.reshape(B, C, 1, 1).to(h.device, h.dtype)
-            #     h = h + beta
-
-
         tail_gate = self.tail_gate(h_cond).view(h.shape[0], self.width, 1, 1)
         h = h + tail_gate * self.tail_conv(h)
         return h
 
-    
- # def encode_trunk_from_components(self, base18: torch.Tensor,
- #                                     Y_scalar: torch.Tensor,
- #                                     theta: torch.Tensor) -> torch.Tensor:
- #        h = self.lift(base18)                           # [B,W,H,W]
- #        y01 = self._y01_from_scalar(Y_scalar)           # [B]
-
- #        eY  = self.time_embed(y01) * self.y_gain        # [B,K]
- #        eT  = self.theta_embed(theta.to(h.dtype))       # [B,K]
- #        h_cond_in = torch.cat([eY, eT], dim=1)   # [B, 2*rbf_K]
- #        h_cond    = self.pre_film(h_cond_in)     # [B, H]
- #        cond      = self.time_cond(h_cond)       # list/tuple len==len(self.blocks)
-
- #        for i, b in enumerate(self.blocks):
- #            h_in = h
- #            h_b  = b(h)
- #            gamma, beta, gate = cond[i]
- #            h = h_in + gate.view(-1,1,1,1) * (h_b - h_in)
- #            h = h * (1.0 + gamma.view(-1, self.width, 1, 1))
- #            if beta is not None:
- #                h = h + beta.view(-1, self.width, 1, 1)
- #        return h
 
     # --- clean API: components in, SU(3) out ---
     def forward(self, base18: torch.Tensor,
@@ -1800,276 +1783,6 @@ class EvolverFNO(nn.Module):
         # Build a Y "map" on-the-fly for the head (broadcast; no dataset storage)
         Ymap = Y_scalar.view(B,1,1,1).expand(B,1,H,W)
         return self.head(h, base18, Ymap)
-
-    # # --- legacy wrapper: accept x with ≥19 ch and optional θ ---
-    # def forward(self, x: torch.Tensor,
-    #             theta: torch.Tensor | None = None,
-    #             Y_scalar: torch.Tensor | None = None) -> torch.Tensor:
-    #     # x may be [B,19,H,W] (base18+Y) or [B,22,H,W] (legacy)
-    #     B, C, H, W = x.shape
-    #     assert C >= 19, f"Expected ≥19 channels (18 base + Y), got C={C}"
-    #     base18 = x[:, :18, ...]
-    #     if Y_scalar is None:
-    #         Y_scalar = x[:, 18, ...].mean(dim=(1,2))    # [B]
-    #     if theta is None and C >= self.y_index + 4:
-    #         #p0 = self.y_index + 1
-    #         theta = theta    # [B,3]
-    #     if theta is None:
-    #         raise ValueError("theta must be provided when x has no θ maps")
-    #     return self.forward_components(base18, Y_scalar, theta)
-
-        
-# class EvolverFNO(nn.Module):
-#     """Lift -> [FNOBlock]*n with Y/θ-conditioned gating/FiLM -> SU3HeadGellMann."""
-#     def __init__(self, in_ch=22, width=64, modes1=12, modes2=12, n_blocks=4,
-#                  identity_eps: float = 0.0, alpha_scale: float = 4.0,
-#                  clamp_alphas=None, alpha_vec_cap=15.0,
-#                  # --- Y / θ conditioning controls ---
-#                  y_index: int = 18,
-#                  film_mode: str = "scale_only",
-#                  rbf_K: int = 12,
-#                  film_hidden: int = 64,
-#                  gamma_scale: float = 1.5,
-#                  beta_scale: float = 1.0,
-#                  gate_temp: float = 2.0,
-#                  y_gain: float = 1.0,
-#                  y_min: float | None = None,
-#                  y_max: float | None = None):
-#         super().__init__()
-#         self.y_index = int(y_index)
-#         self.width = int(width)
-
-#         # ---- Trunk input: exclude BOTH Y and θ (3 ch) from the conv trunk  ----
-#         # Keep everything except indices [y_index, y_index+1, y_index+2, y_index+3]
-#         # so the trunk processes only spatial (non-scalar) channels (base18 in the default layout).
-#         n_trunk_in = int(in_ch) - 4
-#         assert n_trunk_in >= 1, f"Expected at least 4 scalar channels (Y+θ); got in_ch={in_ch}"
-#         self.lift = nn.Conv2d(n_trunk_in, width, kernel_size=1)  # CHANGED: was (in_ch - 1)
-
-#         self.blocks = nn.ModuleList([FNOBlock(width, modes1, modes2) for _ in range(n_blocks)])
-
-#         effective_y_gain = float(y_gain)
-#         self.head = SU3HeadGellMannStochastic(
-#             width,
-#             identity_eps=identity_eps,
-#             alpha_scale=alpha_scale,
-#             clamp_alphas=clamp_alphas,
-#             alpha_vec_cap=alpha_vec_cap,
-#             y_gain=effective_y_gain
-#         )
-
-#         # ---- Conditioning: RBF for Y, small MLP for θ, joint conditioner ----
-#         self.time_embed = RBFEmbed(K=rbf_K)  # e_Y ∈ ℝ^K
-
-#         # NEW: θ embedding (3 scalars -> K-dim), then concatenate with e_Y
-#         self.theta_embed = nn.Sequential(
-#             nn.Linear(3, film_hidden),
-#             nn.SiLU(),
-#             nn.Linear(film_hidden, rbf_K)     # use same K; change if you prefer K_theta
-#         )  # e_θ ∈ ℝ^K
-
-#         # Conditioner now expects concatenated embedding [e_Y ; e_θ] ∈ ℝ^{2K}
-#         self.time_cond = TimeConditioner(
-#             n_blocks=len(self.blocks), ch=width, emb_dim=rbf_K * 2,  # CHANGED: was rbf_K
-#             hidden=film_hidden, film_mode=film_mode,
-#             gamma_scale=gamma_scale, beta_scale=beta_scale,
-#             gate_temp=gate_temp
-#         )
-
-#         self.film_mode = film_mode
-#         self.y_gain = float(y_gain)
-
-#         # Head calibration helpers (unchanged)
-#         self.head.dy_calib = DeltaYCalibrator()
-#         self.head.y_gain = self.y_gain
-
-#         # Y-range buffers for normalizing scalar Y to [0,1]
-#         self.register_buffer("y_min_buf", torch.tensor(0.0), persistent=False)
-#         self.register_buffer("y_max_buf", torch.tensor(1.0), persistent=False)
-#         if (y_min is not None) and (y_max is not None):
-#             self.y_min_buf.fill_(float(y_min))
-#             self.y_max_buf.fill_(float(y_max))
-
-#     # ---------- Helpers ----------
-#     def _slice_exclude_Y_theta(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         """Return all channels except the Y channel and the three θ channels that follow it."""
-#         y_idx = self.y_index
-#         C = x.shape[1]
-#         exclude = {y_idx, y_idx + 1, y_idx + 2, y_idx + 3}
-#         keep = [i for i in range(C) if i not in exclude]
-#         return x[:, keep, ...]  # shape: [B, C-4, H, W]
-
-#     def _slice_base18(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         """Convenience: first 18 channels = base field (for the SU(3) head)."""
-#         return x[:, :18, ...]
-
-#     def _y_scalar01(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         """Average the Y map to a scalar per sample and normalize to [0,1]."""
-#         y_map = x[:, self.y_index, ...]           # [B,H,W]
-#         y_scalar = y_map.mean(dim=(1, 2))         # [B]
-#         y_min = float(self.y_min_buf.item())
-#         y_max = float(self.y_max_buf.item())
-#         if y_max > y_min:
-#             y01 = (y_scalar - y_min) / (y_max - y_min)
-#         else:
-#             y01 = torch.sigmoid(y_scalar)
-#         return y01.clamp(0.0, 1.0)                # [B]
-
-#     def _theta_scalar(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         """Extract θ=(m, Λ_QCD, μ0) as scalars [B,3] from the three channels following Y."""
-#         p0 = int(self.y_index) + 1
-#         theta = x[:, p0:p0 + 3, 0, 0].to(torch.float32)  # [B,3], take any pixel since maps are constant
-#         return theta
-
-#     # ---------- Trunk encoding with Y/θ conditioning ----------
-#     def encode_trunk(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         # 1) Trunk features from non-scalar channels only (exclude Y and θ maps)
-#         x_noYtheta = self._slice_exclude_Y_theta(x)     # CHANGED
-#         h = self.lift(x_noYtheta)                       # [B, W, H, W]
-
-#         # 2) Build conditioning embeddings from scalar Y and θ
-#         y01 = self._y_scalar01(x)                       # [B]
-#         eY  = self.time_embed(y01) * self.y_gain        # [B, K]
-#         theta = self._theta_scalar(x)                   # [B, 3]
-#         eT  = self.theta_embed(theta)                   # [B, K]
-#         t_emb = torch.cat([eY, eT], dim=1)              # [B, 2K]
-#         cond = self.time_cond(t_emb)                    # list of (gamma, beta, gate) for each block
-
-#         # 3) Spectral blocks with gate + FiLM modulation
-#         for i, b in enumerate(self.blocks):
-#             h_in = h
-#             h_b = b(h)                                  # FNO spectral mixing
-#             gamma, beta, gate = cond[i]
-
-#             # Gate the residual (interpolate between identity and full block)
-#             g = gate.view(-1, 1, 1, 1)
-#             h = h_in + g * (h_b - h_in)
-
-#             # FiLM modulation
-#             gam = gamma.view(-1, self.width, 1, 1)
-#             h = h * (1.0 + gam)
-#             if beta is not None:
-#                 bet = beta.view(-1, self.width, 1, 1)
-#                 h = h + bet
-#         return h
-
-#     # ---------- Forward ----------
-#     def forward(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         B, C, H, W = x.shape
-#         # Keep the original channel contract for backward-compatibility
-#         assert C >= 22, f"Expected ≥22 channels (18 base + Y + 3 θ), got C={C}"
-#         assert 0 <= self.y_index < C, f"y_index {self.y_index} out of range for C={C}"
-
-#         base18 = self._slice_base18(x)                        # [B,18,H,W]
-#         Ymap   = x[:, self.y_index:self.y_index+1, ...]       # [B,1,H,W]
-
-#         h = self.encode_trunk(x)
-#         return self.head(h, base18, Ymap)
-
-#     # Backward-compat helper for old probes
-#     def lift_from_full(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         x_noYtheta = self._slice_exclude_Y_theta(x)           # CHANGED
-#         return self.lift(x_noYtheta)
-
-        
-# class EvolverFNO(nn.Module):
-#     """Lift -> [FNOBlock]*n with Y-conditioned gating/FiLM -> SU3HeadGellMann."""
-#     def __init__(self, in_ch=22, width=64, modes1=12, modes2=12, n_blocks=4,
-#                  identity_eps: float = 0.0, alpha_scale: float = 4.0,
-#                  clamp_alphas= None , alpha_vec_cap=15.0, 
-#                  # --- Y conditioning controls ---
-#                  y_index: int = 18,
-#                  film_mode: str = "scale_only",
-#                  rbf_K: int = 12,
-#                  film_hidden: int = 64,
-#                  gamma_scale: float = 1.5,
-#                  beta_scale: float = 1.0,
-#                  gate_temp: float = 2.0,
-#                  y_gain: float = 1.0,
-#                  y_min: float | None = None,
-#                  y_max: float | None = None):
-#         super().__init__()
-#         self.y_index = int(y_index)
-#         self.width = int(width)
-#         self.lift  = nn.Conv2d(in_ch - 1, width, kernel_size=1)  # exclude Y from trunk
-#         self.blocks = nn.ModuleList([FNOBlock(width, modes1, modes2) for _ in range(n_blocks)])
-
-#         effective_y_gain = float(y_gain) #/ y_rng
-#         self.head   = SU3HeadGellMannStochastic(width,
-#                                       identity_eps=identity_eps,
-#                                       alpha_scale=alpha_scale,
-#                                       clamp_alphas=clamp_alphas,
-#                                       alpha_vec_cap=alpha_vec_cap,
-#                                       y_gain=effective_y_gain)
-#         # Time embedding & per-block conditioner
-#         self.time_embed = RBFEmbed(K=rbf_K)
-#         self.time_cond  = TimeConditioner(
-#             n_blocks=len(self.blocks), ch=width, emb_dim=rbf_K,
-#             hidden=film_hidden, film_mode=film_mode,
-#             gamma_scale=gamma_scale, beta_scale=beta_scale,
-#             gate_temp=gate_temp
-#         )
-#         self.film_mode = film_mode
-#         self.y_gain = float(y_gain)
-#         self.head.dy_calib = DeltaYCalibrator()
-#         self.head.y_gain = self.y_gain 
-#         self.register_buffer("y_min_buf", torch.tensor(0.0), persistent=False)
-#         self.register_buffer("y_max_buf", torch.tensor(1.0), persistent=False)
-#         if (y_min is not None) and (y_max is not None):
-#             self.y_min_buf.fill_(float(y_min))
-#             self.y_max_buf.fill_(float(y_max))
-
-#     def _slice_noY(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         y_idx = self.y_index
-#         return torch.cat([x[:, :y_idx], x[:, y_idx+1:]], dim=1)
-
-#     def _y_scalar01(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         y_map = x[:, self.y_index, ...]    # [B,H,W]
-#         y_scalar = y_map.mean(dim=(1,2))   # [B]
-#         y_min = float(self.y_min_buf.item())
-#         y_max = float(self.y_max_buf.item())
-#         if y_max > y_min:
-#             y01 = (y_scalar - y_min) / (y_max - y_min)
-#         else:
-#             y01 = torch.sigmoid(y_scalar)
-#         return y01.clamp(0.0, 1.0)
-
-#     def encode_trunk(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         # Build trunk features with Y-conditioned gating + FiLM
-#         x_noY = self._slice_noY(x)
-#         h = self.lift(x_noY)  # [B, C, H, W]
-#         y01 = self._y_scalar01(x)          # [B]
-#         t_emb = self.time_embed(y01) * self.y_gain  # [B, K]
-#         cond = self.time_cond(t_emb)       # list of (gamma, beta, gate)
-
-#         for i, b in enumerate(self.blocks):
-#             h_in = h
-#             h_b  = b(h)
-#             gamma, beta, gate = cond[i]
-#             g = gate.view(-1, 1, 1, 1)
-#             # Gate the residual (interpolate between h_in and h_b)
-#             h = h_in + g * (h_b - h_in)
-#             # FiLM modulation
-#             gam = gamma.view(-1, self.width, 1, 1)
-#             h = h * (1.0 + gam)
-#             if beta is not None:
-#                 bet = beta.view(-1, self.width, 1, 1)
-#                 h = h + bet
-#         return h
-
-#     def forward(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         B, C, H, W = x.shape
-#         assert C >= 22, f"Expected ≥22 channels (18 U0 + Y + 3 params), got {C}"
-#         assert 0 <= self.y_index < C, f"y_index {self.y_index} out of range for C={C}"
-#         base18 = x[:, :18, :, :]
-#         Ymap   = x[:, 18:19, :, :]
-#         h = self.encode_trunk(x)
-#         return self.head(h, base18, Ymap)
-
-#     # Backward-compat helper for old probes
-#     def lift_from_full(self, x: 'torch.Tensor') -> 'torch.Tensor':
-#         x_noY = self._slice_noY(x)
-#         return self.lift(x_noY)
 
 def _reduce(x: torch.Tensor, reduction: str):
     if reduction == "mean":
@@ -3332,9 +3045,11 @@ class GroupLossWithQs(GroupLoss):
                 sigma_eff = sigma
 
             resid = mu_pred - a_true
-            nll   = 0.5 * (resid / sigma_eff)**2 + torch.log(sigma)
+            baseline = math.log(sigma_floor) + 0.5 * math.log(2.0*math.pi)
+            nll = 0.5 * (resid / sigma_eff)**2 + torch.log(sigma) + 0.5 * math.log(2.0*math.pi) - baseline
             loss_nll = nll.mean()
-            total = total + self.nll_weight * loss_nll
+            total = total + self.nll_weight * loss_nll  # DO NOT negate
+
             
 
         #         if (self.nll_weight != 0.0) and (base18 is not None) \
@@ -3538,31 +3253,33 @@ class GroupLossWithQs(GroupLoss):
 #        t0=time.perf_counter()
 #        #----end-time----
 
-        # 2) Full-cov α-NLL on spatial average (requires composer & θ)
+        # 2) Full-cov α-NLL on spatial average (requires composer & θ)                                                                                                                                  
         if (self.nll_weight != 0.0) and getattr(self, 'use_fullcov', False) \
            and hasattr(self, 'param_nll') and (theta is not None) and (a_true_bar is not None):
             B, C = a_true_bar.shape
-            # Match channels if model uses 16-ch α basis: duplicate 8->16
+            # Match channels if model uses 16-ch α basis: duplicate 8->16                                                                                                                               
             if self.param_nll.C == 16 and C == 8:
                 a_true_bar = torch.cat([a_true_bar, a_true_bar], dim=1)
                 C = 16
             Yv = (Y_final if Y_final is not None else dy_scalar).to(a_true_bar.dtype).view(-1)
             mu_unit, L, kappa = self.param_nll(theta)
-            muY   = self.param_nll.compose_mu(mu_unit, kappa, Yv)           # [B,C]
-            CovY  = self.param_nll.cov_to_Y(L, kappa, Yv)                   # [B,C,C]
-            # Cholesky of CovY (jitter for numerical safety)
+            muY   = self.param_nll.compose_mu(mu_unit, kappa, Yv)           # [B,C]                                                                                                                     
+            CovY  = self.param_nll.cov_to_Y(L, kappa, Yv)                   # [B,C,C]                                                                                                                   
+            # Cholesky of CovY (jitter for numerical safety)                                                                                                                                            
             eyeC = torch.eye(C, device=CovY.device, dtype=CovY.dtype).unsqueeze(0).expand(B,-1,-1)
-            L_Y = torch.linalg.cholesky(CovY + 1e-6 * eyeC)                 # [B,C,C]
-            resid = (a_true_bar - muY).unsqueeze(-1)                        # [B,C,1]
-            # Solve Σ^{-1} resid via cholesky_solve
-            sol = torch.cholesky_solve(resid, L_Y)                          # [B,C,1]
-            maha = (resid.transpose(1,2) @ sol).squeeze(-1).squeeze(-1)     # [B]
+            sigma_floor = 1e-2  # match your diagonal case
+            L_Y = torch.linalg.cholesky(CovY + (sigma_floor**2) * eyeC)
+            resid = (a_true_bar - muY).unsqueeze(-1)                        # [B,C,1]                                                                                                                   
+            # Solve Σ^{-1} resid via cholesky_solve                                                                                                                                                     
+            sol = torch.cholesky_solve(resid, L_Y)                          # [B,C,1]                                                                                                                   
+            maha = (resid.transpose(1,2) @ sol).squeeze(-1).squeeze(-1)     # [B]                                                                                                                       
             logdet = 2.0 * torch.log(torch.diagonal(L_Y, dim1=-2, dim2=-1)).sum(-1)
-            loss_nll_full = 0.5 * (5.*maha + logdet + C*math.log(2.0*math.pi)) #times 5 added , make it a parameter
+            logdet_shift = logdet - C * math.log(sigma_floor**2)  # = log det(Σ / σ_floor^2 I) ≥ 0                                                                                                      
+            loss_nll_full = 0.5 * (5. * maha + logdet_shift)   # (scale_maha = 5.0 in your code)                                                                                                        
             loss_nll_full = loss_nll_full.mean()
             total = total + self._wb('nll', loss_nll_full, self.nll_weight)
 
-
+            
 #            #----time----
 #            if torch.cuda.is_available(): torch.cuda.synchronize()
 #            print(f"[timing] NLL 2: {(time.perf_counter()-t0)*1e3:.2f} ms")
@@ -4237,6 +3954,7 @@ def _parse_quad_pairs_list(s: str, dipole_offsets=None):
                 a_, b_ = (a,b) if key(a) <= key(b) else (b,a)
                 pairs.add((a_, b_))
         # return as list in a stable order
+        #print("QUADPAIRS=",pairs)
         return [ (a,b) for (a,b) in sorted(pairs, key=lambda p: ((abs(p[0][0])+abs(p[0][1])), (abs(p[1][0])+abs(p[1][1])), p)) ]
     # --- Radius list (axial) ---
     if s_lower.startswith('r='):
@@ -4364,7 +4082,7 @@ def train(args):
         alpha_scale=3.0, clamp_alphas=getattr(args, "clamp_alphas", 2.),
         y_index=args.y_channel, film_mode=args.film_mode, rbf_K=args.rbf_K,
         film_hidden=args.film_hidden, gamma_scale=args.gamma_scale,
-        beta_scale=args.beta_scale, gate_temp=args.gate_temp, y_gain=args.y_gain,
+        beta_scale=args.beta_scale, gate_temp=args.gate_temp,
         y_min=(args.y_min if args.y_min is not None else y_min_data),
         y_max=(args.y_max if args.y_max is not None else y_max_data),
         y_map=args.y_map,
@@ -4798,12 +4516,11 @@ def train(args):
                     meters.add("train/rollout_cons", cons.detach(), base18.size(0))
 
                 # --- semigroup ---
-                _sg_w = float(sg_w)
-                if (base18.device.type == 'cpu') and bool(getattr(args,'skip_heavy_on_cpu', True)):
-                    _sg_w = 0.0
-                sg_p = float(getattr(args, "semigroup_prob", 0.0))
+                # --- semigroup on dipoles instead of Wilson lines ---
+                use_sg = (args.semigroup_weight > 0) and (torch.rand(()) < getattr(args, "semigroup_prob", 1.0))
+                use_sg = use_sg and not (getattr(args, "skip_heavy_on_cpu", False) and not torch.cuda.is_available())
 
-                if _sg_w > 0.0 and (sg_p >= 1.0 or torch.rand((), device=base18.device) < sg_p):
+                if use_sg:
                     # Split Y into two parts: Y_a + Y_b = Y
                     # Option 1: random split
                     split = torch.rand((), device=base18.device)
@@ -4812,14 +4529,39 @@ def train(args):
                     # (Option 2: deterministic half-split)
                     # Y_a = 0.5 * Y_scalar
                     # Y_b = Y_scalar - Y_a
+                    # (Keep your existing code that creates Y_a, Y_b and runs the model twice.)
+                    #
+                    # Example skeleton (match to your variable names):
+                    u_a       = model(base18, Y_a, theta)
+                    u_comp    = model(u_a,   Y_b, theta)          # two-step (compose)
+                    u_direct  = model(base18, Y_a + Y_b, theta)   # one-step (direct)
 
-                    # Compose and compare (pass scalars, not channels)
-                    u_comp, u_direct = semigroup_compose(model, base18, Y_a, Y_b, theta)
-                    sgl = torch.mean((u_comp - u_direct) ** 2)
-                    loss = loss + _sg_w * sgl
-                    meters.add("train/semigroup", sgl.detach(), base18.size(0))
-                else:
-                    meters.add("train/semigroup", torch.zeros((), device=base18.device), base18.size(0))
+                    # Compute dipole summaries (B, K) for both branches
+                    # Optionally, pass a fixed 'offsets' from args for reproducibility.
+                    sg_offsets = getattr(args, "sg_dipole_offsets", None)
+                    # If args.sg_dipole_offsets is a comma-separated string like "1,2,4",
+                    # you can parse it into actual (dy,dx) pairs above where you parse args.
+
+                    Nd = dipole_from_links18(u_direct, offsets=sg_offsets)  # (B,K)
+                    Nc = dipole_from_links18(u_comp,   offsets=sg_offsets)  # (B,K)
+
+                    sg_loss = F.mse_loss(Nd, Nc)
+
+                    loss = loss + sg_w * sg_loss
+
+                    meters.add("train/semigroup", sg_loss.detach(), base18.size(0))
+
+                    
+                # _sg_w = float(sg_w)
+                # if (base18.device.type == 'cpu') and bool(getattr(args,'skip_heavy_on_cpu', True)):
+                #     _sg_w = 0.0
+                # sg_p = float(getattr(args, "semigroup_prob", 0.0))
+
+
+                #     # Compose and compare (pass scalars, not channels)
+                #     u_comp, u_direct = semigroup_compose(model, base18, Y_a, Y_b, theta)
+                #     sgl = torch.mean((u_comp - u_direct) ** 2)
+                #     loss = loss + _sg_w * sgl
 
                 
             meters.add("train/frob", stats["frob"], base18.size(0))
@@ -5081,6 +4823,7 @@ def train(args):
         val_qslope_list = []
         val_mono_list   = []
         val_dy_all, val_qp_all, val_qt_all = [], [], []
+        val_q4p_all, val_q4t_all = [], []  # accumulate quadrupole preds/targets per batch
         
         if val_sampler is not None:
             try: val_sampler.set_epoch(epoch)
@@ -5198,8 +4941,20 @@ def train(args):
                     val_qp_all.append(qp.detach().cpu().numpy())
                     val_qt_all.append(qt.detach().cpu().numpy())
                     val_dy_all.append(dy_scalar.view(-1).detach().cpu().numpy())
+
                 except Exception:
                     pass
+
+                # Quadrupole accumulators per batch, if available
+                try:
+                    if getattr(criterion, "quad_weight", 0.0) != 0.0 and len(getattr(criterion, "quad_pairs", [])) > 0:
+                        Q4h = criterion._quadrupole(Uh)  # [B, n_pairs]
+                        Q4t = criterion._quadrupole(Ut)  # [B, n_pairs]
+                        val_q4p_all.append(Q4h.detach().cpu().numpy())
+                        val_q4t_all.append(Q4t.detach().cpu().numpy())
+                except Exception:
+                    pass
+                
 
                 val_sum += l.detach().to(val_sum.dtype)
                 val_cnt += 1
@@ -5558,6 +5313,93 @@ def train(args):
             print(f"[val Qs(ΔY bins)] edges={edges}  rmse={np.array(rmse_bins)}  mape={np.array(mape_bins)}")
             print(f"[val Qs(ΔY top quartile)] rmse={top_rmse:.3e} mape={top_mape:.3e} "
                   f"Qs_pred_mean={top_pred:.3e} Qs_true_mean={top_true:.3e}")
+
+            # ---- Quadrupole RMSE in ΔY quantile bins (matching Qs bins) ----
+            try:
+                import numpy as _np
+                q4_rmse_bins = None
+                q4_rmse_bins_mean = None
+                q4_combined = None
+                qs_combined = None
+                combined_total = None
+
+                if len(val_q4p_all) > 0 and len(val_q4t_all) > 0:
+                    q4p = _np.concatenate(val_q4p_all, axis=0)  # [N, n_pairs]
+                    q4t = _np.concatenate(val_q4t_all, axis=0)  # [N, n_pairs]
+                    n_pairs = q4p.shape[1] if q4p.ndim == 2 else 0
+
+                    q4_rmse_bins = []
+                    q4_counts_bins = []
+                    for i in range(len(edges)-1):
+                        m = (dy >= edges[i]) & (dy < edges[i+1] if i < len(edges)-2 else dy <= edges[i+1])
+                        if m.any():
+                            # RMSE per pair in this bin
+                            err = _np.sqrt(_np.mean((q4p[m, :] - q4t[m, :])**2, axis=0))  # [n_pairs]
+                            q4_rmse_bins.append(err.tolist())
+                            q4_counts_bins.append(int(m.sum()))
+                        else:
+                            q4_rmse_bins.append([_np.nan] * (n_pairs))
+                            q4_counts_bins.append(0)
+
+                    # Mean across pairs per bin (ignoring NaNs)
+                    q4_rmse_bins_mean = [
+                        float(_np.nanmean(_np.array(bin_err))) if _np.isfinite(_np.array(bin_err)).any() else float("nan")
+                        for bin_err in q4_rmse_bins
+                    ]
+
+                    # Weighted combined RMSE across all bins & pairs
+                    num = 0.0; den = 0
+                    for cnt, bin_err in zip(q4_counts_bins, q4_rmse_bins):
+                        if cnt > 0:
+                            arr = _np.array(bin_err, dtype=float)
+                            mask = _np.isfinite(arr)
+                            if mask.any():
+                                num += cnt * float(_np.nanmean(arr[mask]**2))
+                                den += cnt
+                    q4_combined = float(_np.sqrt(num / max(den, 1))) if den > 0 else float("nan")
+                else:
+                    q4_rmse_bins = []
+                    q4_rmse_bins_mean = []
+                    q4_combined = float("nan")
+
+                # Also compute a weighted-combined RMSE for Qs across bins
+                qs_counts_bins = []
+                for i in range(len(edges)-1):
+                    m = (dy >= edges[i]) & (dy < edges[i+1] if i < len(edges)-2 else dy <= edges[i+1])
+                    qs_counts_bins.append(int(m.sum()))
+                num = 0.0; den = 0
+                for cnt, rm in zip(qs_counts_bins, rmse_bins):
+                    if _np.isfinite(rm):
+                        num += cnt * (rm**2)
+                        den += cnt
+                qs_combined = float(_np.sqrt(num / max(den, 1))) if den > 0 else float("nan")
+
+                # Final combined scalar (equal weight between Qs and quadrupoles)
+                if _np.isfinite(qs_combined) and _np.isfinite(q4_combined):
+                    combined_total = float(0.5 * (qs_combined + q4_combined))
+                elif _np.isfinite(qs_combined):
+                    combined_total = float(qs_combined)
+                elif _np.isfinite(q4_combined):
+                    combined_total = float(q4_combined)
+                else:
+                    combined_total = float("nan")
+
+                # Emit a single-line, tuner-readable JSON metric
+                tuner_payload = {
+                    "epoch": int(epoch),
+                    "qs_rmse_bins": [float(x) if _np.isfinite(x) else None for x in rmse_bins],
+                    "qs_rmse_combined": qs_combined,
+                    #"q4_rmse_bins_per_pair": q4_rmse_bins,            # list[len=4] of lists[len=n_pairs]
+                    "q4_rmse_bins_mean": q4_rmse_bins_mean,           # per-bin mean across pairs
+                    "q4_rmse_combined": q4_combined,                  # weighted across bins & pairs
+                    "combined_rmse_total": combined_total             # single scalar for tuner
+                }
+                print("TUNER_METRIC " + json.dumps(tuner_payload), flush=True)
+                print("TUNER_SCALAR ", combined_total)
+            except Exception as _e:
+                # Keep training robust if diagnostics fail
+                if ((not is_ddp) or dist.get_rank()==0):
+                    print(f"[tuner metric] skipped: {_e}")
                     
         if ema_eval: ema.swap_out(unwrap(model))
 
@@ -5678,14 +5520,13 @@ def main():
     ap.add_argument("--gamma_scale", type=float, default=1.5, help='Initial scale for FiLM gamma (multiplicative) parameters.')
     ap.add_argument("--beta_scale", type=float, default=1.0, help='Initial scale for FiLM beta (additive) parameters (if used).')
     ap.add_argument("--gate_temp", type=float, default=1.0, help='Temperature for gating nonlinearity in the time conditioner; higher = sharper gates.')
-    ap.add_argument("--y_gain", type=float, default=1.0, help='Global gain applied to the Y map in the head (helps very small |Y| regimes).')
     ap.add_argument("--y_min", type=float, default=None, help="Override data-inferred Y min (optional)")
     ap.add_argument("--y_max", type=float, default=None, help="Override data-inferred Y max (optional)")
     ap.add_argument("--skip_heavy_on_cpu", type=int, default=1, help="No rollouton CPU")
     
 
     ap.add_argument("--trace_weight",    type=float, default=0, help='Weight of trace of Wilson lines.')
-    ap.add_argument("--geo_weight",    type=float, default=5e-2, help='Weight of geodesic distance term in GroupLoss (keeps outputs on-manifold).')
+    ap.add_argument("--geo_weight",    type=float, default=0, help='Weight of geodesic distance term in GroupLoss (keeps outputs on-manifold).')
     ap.add_argument("--dir_weight",    type=float, default=0, help='Weight of direction-hinge term encouraging correct ΔU direction with Y.')
     ap.add_argument("--dir_margin",    type=float, default=0.25, help='Cosine-similarity margin used by the direction-hinge term.')
     ap.add_argument("--project_before_frob", type=int, default=1, help='If 1, project prediction to SU(3) before computing Frobenius loss term.')
@@ -5693,7 +5534,7 @@ def main():
     # --- Dipole & Qs & higher order correlator loss flags ---
     ap.add_argument("--dipole_weight", type=float, default=0.5,
                     help="Weight of MSE loss on dipole correlator S(r) evaluated at --dipole_offsets.")
-    ap.add_argument("--dipole_offsets", type=str, default="(1,0),(0,1),(2,0),(0,2),(4,0),(0,4),(8,0),(0,8)",
+    ap.add_argument("--dipole_offsets", type=str, default="(1,0),(0,1),(2,0),(0,2),(4,0),(0,4),(8,0),(0,8),(12,0),(0,12)(16,0),(0,16)",
                     help="Comma-separated list of (dx,dy) axial separations for S(r); at least two distinct |r| needed for Qs.")
     ap.add_argument("--qs_weight", type=float, default=0.,
                     help="Weight of MSE loss on saturation scale Qs derived from the dipole correlator.")
@@ -5717,7 +5558,7 @@ def main():
     ap.add_argument("--quad_weight", type=float, default=0.0, help="Weight for quadrupole loss.")
     ap.add_argument("--loops_rects", type=str, default="(1,1),(1,2),(2,2)", help="Rectangles (a,b).")
     ap.add_argument("--loops_weight", type=float, default=0.0, help="Weight for Wilson loop loss.")    
-    ap.add_argument("--rough_weight", type=float, default=0.1, help="Weight for fluctuation scale loss.")
+    ap.add_argument("--rough_weight", type=float, default=0., help="Weight for fluctuation scale loss.")
     ap.add_argument("--kmin", type=float, default=4., help="Minimum k for which to include fluctuations.")
     ap.add_argument("--kmax", type=float, default=None, help="Max k for fluctuation scale loss.")
     ap.add_argument("--mono_weight", type=float, default=0.0, help="Weight for monotonic N(r,Y) penalty using pairs.")
