@@ -994,7 +994,7 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
     model.eval()
     with torch.no_grad():
         base18, Y_scalar, theta = split_legacy_x(x)
-        yhat = model(base18, Y_scalar, theta, sample)  # [1,18,H,W]
+        yhat = model(base18, Y_scalar, theta, sample=sample)  # [1,18,H,W]
 
 
         #     # quick movement check before any projection/repair

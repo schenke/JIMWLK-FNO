@@ -1720,7 +1720,7 @@ class EvolverFNO(nn.Module):
 
 
     # --- clean API: components in, SU(3) out ---
-    def forward(self, base18, Y_scalar, theta, 
+    def forward(self, base18, Y_scalar, theta, *,
                 sample: bool | None = None,
                 nsamples: int = 1,
                 dY=None):
