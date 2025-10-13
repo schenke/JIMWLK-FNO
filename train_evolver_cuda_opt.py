@@ -1224,6 +1224,7 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.last_A_fro_mean = (S.real.square().sum(dim=(-2,-1)).sqrt().mean()).detach()
         return A, S
 
+    #only works for nsamples=1 when sampling
     def forward(self, h: torch.Tensor, base18: torch.Tensor, Ymap: torch.Tensor,
                 nsamples: int = 1, sample: bool | None = None, dY=None) -> torch.Tensor:
         # Optional fast exit at Y≈0
@@ -1250,8 +1251,6 @@ class SU3HeadGellMannStochastic(nn.Module):
         amp = F.softplus(self.amp_head(h)).float()      # [B,1,H,W] ≥ 0
         self.last_amp = amp
 
-
-
         y_eff = Ymap[:, 0, :, :].to(mu.real.dtype)                 # [B,H,W]
 
         # Broadcast helpers
@@ -1264,15 +1263,6 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.last_mu = mu
         self.last_logsig = logsig
         self.last_y_sigma = y_sigma
-
-        sigma_amp = self.sigma_floor + F.softplus(sigma_logits)
-
-        # with torch.no_grad():
-        #     mu_rms = mu.pow(2).mean().sqrt().item()
-        #     s = self.sigma_floor + F.softplus(self.sigma_head(mu))
-        #     s_rms = s.pow(2).mean().sqrt().item()
-        #     print(f"[debug2] mu_rms={mu_rms:.3e}  sigma_mean={s.mean().item():.3e}  sigma_rms={s_rms:.3e}")
-
 
         # Sampling
         if sample:
@@ -1304,8 +1294,8 @@ class SU3HeadGellMannStochastic(nn.Module):
 
 
             # overall learnable gain + per-pixel amplitude
-            eta = self.op_gain * amp * eta_core   # (was sigma_amp)
-
+#            eta = self.op_gain * amp * eta_core   # (was sigma_amp)
+            eta = sigma * eta_core
             
             B = base18.shape[0]
             if dY is None:
@@ -1323,56 +1313,11 @@ class SU3HeadGellMannStochastic(nn.Module):
             self.last_sigma_mean = amp.detach().mean()  # alias to amp for compat
             self.last_sigma_min  = amp.detach().min()
             self.last_sigma_max  = amp.detach().max()
-
-            # if self.sigma_mode == "diag":
-            #     eta = sigma * epsn
-
-            # elif self.sigma_mode == "conv":
-            #     # Operator Bθ: depthwise k×k conv + 1×1 color mixer
-            #     # Note: keep amplitude control via your existing sigma map
-            #     eta = self.noise_pw(self.noise_dw(epsn))
-            #     eta = sigma * eta
-
-            # elif self.sigma_mode == "spectral":
-            #     # Build a per-frequency radial gain G_c(|k|) = 1 / (1 + (|k|/k0)^p)
-            #     B, C, H, W = mu.shape
-            #     Ef = torch.fft.rfft2(epsn, norm="ortho")  # [B,C,Hf,Wf] complex
-            #     # normalized freq grid in cycles/pixel
-            #     ky = torch.fft.rfftfreq(H, d=1.0).to(Ef.device)  # [Hf]
-            #     kx = torch.fft.rfftfreq(W, d=1.0).to(Ef.device)  # [Wf]
-            #     Ky = ky.view(-1, 1).expand(H//2+1, W//2+1)
-            #     Kx = kx.view(1, -1).expand(H//2+1, W//2+1)
-            #     Kr = torch.sqrt(Kx**2 + Ky**2)  # [Hf,Wf], real
-            #     k0 = torch.clamp(self.spec_k0, min=1e-3).view(1, C, 1, 1)
-            #     p  = torch.relu(self.spec_p).view(1, C, 1, 1)
-            #     # broadcast radial profile to channels
-            #     G = (1.0 / (1.0 + (Kr.view(1,1,*Kr.shape) / k0)**p)).to(Ef.dtype)  # [1,C,Hf,Wf]
-            #     Ef_filt = Ef * G
-            #     eta = torch.fft.irfft2(Ef_filt, s=(H, W), norm="ortho")
-            #     eta = sigma * eta
-
-            # else:
-            #     raise ValueError(f"Unknown sigma_mode: {self.sigma_mode}")
-
-            # a_all = mu + eta
-
-            # # # σ(Y) = y_eff * softplus(logσ̂)  => vanishes at Y=0 and grows smoothly
-            # # sigma = y_sigma * F.softplus(logsig)
-            # #self.last_sigma_mean = sigma.mean().detach()
-            # self.last_sigma_mean = eta.abs().mean().detach()
-
-            # self.last_sigma_mode = self.sigma_mode
-            # self.last_eta_rms = eta.detach().square().mean()
-            # # epsn = torch.randn_like(mu)
-            # a_all = mu + sigma * epsn
         else:
             a_all = mu
             # # σ(Y) = y_eff * softplus(logσ̂)  => vanishes at Y=0 and grows smoothly
             # sigma = y_sigma * F.softplus(logsig)
             self.last_sigma_mean = sigma.mean().detach()
-
-
-
             
         # Split into Left/Right sets
         if C == 16:
@@ -1411,7 +1356,7 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         # Optional identity snap at Y≈0 using *physical* Y (not rescaled)
         if eps > 0.0:
-            y_abs0 = y_raw[:, 0, 0].abs()
+            y_abs0 = y_eff[:, 0, 0].abs()
             if (y_abs0 <= eps).any():
                 mask = (y_abs0 <= eps)
                 out18 = out18.clone()
@@ -1775,14 +1720,22 @@ class EvolverFNO(nn.Module):
 
 
     # --- clean API: components in, SU(3) out ---
-    def forward(self, base18: torch.Tensor,
-                           Y_scalar: torch.Tensor,
-                           theta: torch.Tensor) -> torch.Tensor:
+    def forward(self, base18, Y_scalar, theta, 
+                sample: bool | None = None,
+                nsamples: int = 1,
+                dY=None):
         B, _, H, W = base18.shape
         h = self.encode_trunk_from_components(base18, Y_scalar, theta)
-        # Build a Y "map" on-the-fly for the head (broadcast; no dataset storage)
-        Ymap = Y_scalar.view(B,1,1,1).expand(B,1,H,W)
-        return self.head(h, base18, Ymap)
+        Ymap = Y_scalar.view(B, 1, 1, 1).expand(B, 1, H, W)
+        return self.head(h, base18, Ymap, nsamples=nsamples, sample=sample, dY=dY)
+    # def forward(self, base18: torch.Tensor,
+    #                        Y_scalar: torch.Tensor,
+    #                        theta: torch.Tensor) -> torch.Tensor:
+    #     B, _, H, W = base18.shape
+    #     h = self.encode_trunk_from_components(base18, Y_scalar, theta)
+    #     # Build a Y "map" on-the-fly for the head (broadcast; no dataset storage)
+    #     Ymap = Y_scalar.view(B,1,1,1).expand(B,1,H,W)
+    #     return self.head(h, base18, Ymap)
 
 def _reduce(x: torch.Tensor, reduction: str):
     if reduction == "mean":
@@ -2175,8 +2128,6 @@ class GroupLossWithQs(GroupLoss):
         qs_local: bool = False,
         qs_scale: float = 1.0,
         # higher-order
-        loops_weight: float = 0.0,
-        loops_rects=((1,1),(1,2),(2,2)),
         quad_weight: float = 0.0,
         quad_pairs=(((1,0),(0,1)), ((2,0),(0,2))),
         rough_weight: float = 0.0,
@@ -2206,8 +2157,6 @@ class GroupLossWithQs(GroupLoss):
         self.qs_local = bool(qs_local)
         self.qs_scale = float(qs_scale)
         # higher-order
-        self.loops_weight = float(loops_weight)
-        self.loops_rects  = tuple(tuple(map(int, r)) for r in loops_rects)
         self.quad_weight  = float(quad_weight)
         self.quad_pairs   = tuple((tuple(map(int, a)), tuple(map(int, b))) for (a,b) in quad_pairs)
         self.rough_weight = float(rough_weight)   # new arg with default 0.0
@@ -2244,8 +2193,7 @@ class GroupLossWithQs(GroupLoss):
         self.I3 = torch.eye(3, dtype=torch.cfloat)
         self.moment_weight = float(moment_weight)        
         print("[loss cfg] dipole_w=", self.dipole_weight, "qs_w=", self.qs_weight, "tr_w=", self.w_trace,
-              "geo_w=", self.geo_weight, "loops_weight=", self.loops_weight,
-              "quad_weight=", self.quad_weight, "moment_weight=", self.moment_weight, "qs_slope_w=", self.qs_slope_weight, "nll_weight=", self.nll_weight, "energy_weight=", self.energy_weight)
+              "geo_w=", self.geo_weight, "quad_weight=", self.quad_weight, "moment_weight=", self.moment_weight, "qs_slope_w=", self.qs_slope_weight, "nll_weight=", self.nll_weight, "energy_weight=", self.energy_weight)
 
 
         
@@ -2654,37 +2602,6 @@ class GroupLossWithQs(GroupLoss):
         return Qs  # shape: [B] or [B,H,W]
 
 
-    # ---- higher-order correlators --------------------------------------
-    @staticmethod
-    def _rect_loop(U: 'torch.Tensor', a: int, b: int) -> 'torch.Tensor':
-        """
-        Rectangle-like loop surrogate using periodic shifts.
-        a: shift along +x (W dimension = dim 2)
-        b: shift along +y (H dimension = dim 1)
-        U shape: [B, H, W, 3, 3] complex
-        """
-        # Shifts must match dims in length!
-        Ua   = U
-        Ub   = torch.roll(U, shifts=(a,), dims=(2,))           # +x by a
-        Uab  = torch.roll(U, shifts=(b, a), dims=(1, 2))       # +y by b, +x by a
-        Ub_y = torch.roll(U, shifts=(b,), dims=(1,))           # +y by b
-
-        # loop = U(x) · U†(x+a,0) · U(x+a,b) · U†(x,b)
-        loop = Ua @ Ub.conj().transpose(-1, -2) @ Uab @ Ub_y.conj().transpose(-1, -2)
-        return loop
-
-    def _wilson_loops(self, U: 'torch.Tensor') -> 'torch.Tensor':
-        if self.project_before_frob:
-            U_q = U
-        else:
-            U_q  = self._su3_project(U)       # U here is raw truth when pre-proj is False
-        outs = []
-        for (a, b) in self.loops_rects:
-            L = self._rect_loop(U_q, a, b)
-            w = torch.diagonal(L, dim1=-2, dim2=-1).sum(-1).real / 3.0   # [B,H,W]
-            outs.append(w.mean(dim=(1, 2)))                               # [B]
-        return torch.stack(outs, dim=-1) if outs else U_q.new_zeros((U_q.shape[0], 0))
-
 
     def _quadrupole(self, U: torch.Tensor) -> torch.Tensor:
         U_q = U if self.project_before_frob else self._su3_project(U)  # [B,H,W,3,3] complex
@@ -2831,16 +2748,7 @@ class GroupLossWithQs(GroupLoss):
             #if torch.cuda.is_available(): torch.cuda.synchronize()
             #print(f"[timing] Dipole block: {(time.perf_counter()-t0)*1e3:.2f} ms")
             #----end-time----
-
-
             
-        if self.loops_weight != 0.0 and len(self.loops_rects) > 0:
-            Wh = self._wilson_loops(Uh_q)
-            Wt = self._wilson_loops(U_q)
-            loss_loops = torch.nn.functional.mse_loss(torch.log((1-Wh).clamp_min(1e-6)),
-                                                      torch.log((1-Wt).clamp_min(1e-6)))
-            total = total + self.loops_weight * loss_loops
-
         if self.quad_weight and self.quad_pairs:
             # optionally limit to K random pairs per step to cap work
             pairs = self.quad_pairs
@@ -3545,10 +3453,6 @@ class GroupLossWithQs(GroupLoss):
             # except Exception as e:
             #     out["dip_mse_error"] = str(e)
             
-            if self.loops_weight != 0.0 and len(self.loops_rects) > 0:
-                Wh = self._wilson_loops(Uh); Wt = self._wilson_loops(U)
-                out["loops_mse"] = float(torch.nn.functional.mse_loss(torch.log((1-Wh).clamp_min(1e-6)),
-                                                                  torch.log((1-Wt).clamp_min(1e-6))).detach())
             if self.quad_weight != 0.0 and len(self.quad_pairs) > 0:
                 Q4h = self._quadrupole(Uh); Q4t = self._quadrupole(U)
                 out["quad_mse"] = float(torch.nn.functional.mse_loss(Q4h, Q4t).detach())
@@ -4292,14 +4196,12 @@ def train(args):
         w_geo   = args.geo_weight * ramp(e, start=E1, duration=E2-E1)
         w_dir   = args.dir_weight * ramp(e, start=E1, duration=E2-E1)
         w_tr    = args.trace_weight * ramp(e, start=E1, duration=E2-E1)
-        w_loops = args.loops_weight * ramp(e, start=E1, duration=max(1,(E2-E1)/2))
         w_quad  = args.quad_weight  * ramp(e, start=E1, duration=max(1,(E2-E1)))
         w_nll   = args.nll_weight  * ramp(e, start=E1, duration=max(1,(E2-E1)))
         w_energy= args.energy_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
         
         # derive correlator geometry from args
         dipole_offsets = _parse_offsets_list(getattr(args, "dipole_offsets", "(1,0),(0,1),(2,0),(0,2)"))
-        loops_rects    = _parse_rects_list(getattr(args, "loops_rects", "(1,1),(1,2),(2,2)"))
         quad_pairs     = _parse_quad_pairs_list(getattr(args, "quad_pairs", "auto_from_dipole"), dipole_offsets=dipole_offsets)
 
 
@@ -4318,8 +4220,7 @@ def train(args):
             qs_weight=w_qs, qs_threshold=0.5, qs_on='N', qs_local=True,
             qs_soft_beta=args.qs_soft_beta,
             qs_soft_slope=args.qs_soft_slope,
-            quad_weight=w_quad, loops_weight=w_loops,
-            loops_rects=loops_rects, quad_pairs=quad_pairs,
+            quad_weight=w_quad, quad_pairs=quad_pairs,
             mono_weight=float(getattr(args,"mono_weight",0.0)),
             qs_slope_weight=float(getattr(args,"qs_slope_weight",0.0)),
             moment_weight=float(getattr(args,"moment_weight",0.0)),
@@ -4444,10 +4345,6 @@ def train(args):
                 if mu_pred is None or logsig_pred is None:
                     print("[warn] last_mu/logsig missing; NLL will be inactive.")
 
-                # θ=(m,Λ_QCD,μ0) comes right after the Y-channel
-                #p0 = int(getattr(args, "y_channel", 18)) + 1
-    #            if torch.cuda.is_available():
-    #                e["loss"][0].record()
 
 #                #----time----
 #                if torch.cuda.is_available(): torch.cuda.synchronize();
@@ -4467,53 +4364,79 @@ def train(args):
                     return_stats=True
                 )
 
-                # if getattr(criterion, "moment_weight", 0.0) > 0:
-                #     print("[moment dbg] drift is None?", mu_pred is None, "amp is None?", amp_pred is None)
-                #     m, m1, m2 = stats.get("moment"), stats.get("moment_m1"), stats.get("moment_m2")
-                #     if (m is not None) and (m1 is not None) and (m2 is not None):
-                #         print(f"[moment] total={float(m):.3e}  m1={float(m1):.3e}  m2={float(m2):.3e}")
-                        
-                
-                # # --- moment loss diagnostics ---
-                # if getattr(criterion, "moment_weight", 0.0) > 0:
-                #     m  = stats.get("moment", None)
-                #     m1 = stats.get("moment_m1", None)
-                #     m2 = stats.get("moment_m2", None)
-                #     if (m is not None) and (m1 is not None) and (m2 is not None):
-                #         print(f"[moment] total={float(m):.3e}  m1={float(m1):.3e}  m2={float(m2):.3e}")
-                #     else:
-                #         print("[moment] (no stats found) → check that the moment block is in GroupLossWithQs.forward and that drift_pred/amp_pred are being passed in.")
-
-                
-     #           if torch.cuda.is_available():
-     #               e["loss"][1].record()
 #                #----time----
 #                if torch.cuda.is_available(): torch.cuda.synchronize()
 #                print(f"[timing] loss: {(time.perf_counter()-t0)*1e3:.2f} ms")
 #                #----end-time----
 
+
+                # ----- Rollout consistency (state) + rollout SINGLE consistency (transition) -----
                 rollout_k = int(rollout_k_curr)
-                rollout_cons_w = float(cons_w)
-                if (base18.device.type == 'cpu') and bool(getattr(args,'skip_heavy_on_cpu', True)):
-                    rollout_cons_w = 0.0
+                w_state   = float(getattr(args, "rollout_consistency", 0.0))            # state match
+                w_single  = float(getattr(args, "rollout_single_consistency", 0.0))     # transition match
 
-                # rollout consistency regularizer (only if both enabled)
-                if (rollout_k > 1) and (rollout_cons_w > 0.0):
+                # Disable heavy stuff on CPU if requested
+                if (base18.device.type == "cpu") and bool(getattr(args, "skip_heavy_on_cpu", True)):
+                    w_state = 0.0
+                    w_single = 0.0
+
+                if rollout_k > 1 and (w_state > 0.0 or w_single > 0.0):
+                    # k small steps vs one big step to reach the same rapidity k*ΔY
                     yhat_roll, yhat_single_big = rollout_predict(model, base18, Y_scalar, rollout_k, theta)
-                    cons = ((yhat_roll - yhat_single) ** 2).mean()
-                    loss = loss + rollout_cons_w * cons
-                    meters.add("train/rollout_cons", cons.detach(), base18.size(0))
-                    del yhat_roll, yhat_single_big, cons
-                else:
-                    # keep the metric stream consistent; log zero when disabled
-                    meters.add("train/rollout_cons",
-                               torch.zeros((), device=base18.device), base18.size(0))
 
-                # rollout-single consistency
-                if int(getattr(args, "rollout_k", 1)) > 1 and float(getattr(args, "rollout_consistency", 0.0)) > 0.0 and (yhat_single is not None):
-                    cons = torch.mean((yhat_single - yhat) ** 2)
-                    loss = loss + float(args.rollout_consistency) * cons
-                    meters.add("train/rollout_cons", cons.detach(), base18.size(0))
+                    sg_offsets = getattr(args, "sg_dipole_offsets", None)
+
+                    # ---- STATE consistency: match states at k*ΔY ----
+                    if w_state > 0.0:
+                        Nd = dipole_from_links18(yhat_single_big, offsets=sg_offsets)
+                        Nc = dipole_from_links18(yhat_roll,       offsets=sg_offsets)
+                        rollout_state_loss = F.mse_loss(Nd, Nc)
+                        loss = loss + w_state * rollout_state_loss
+                        meters.add("train/rollout_state_cons", rollout_state_loss.detach(), base18.size(0))
+
+                    # ---- SINGLE consistency: match one-step transitions from that state ----
+                    if w_single > 0.0:
+                        next_from_roll = model(yhat_roll.detach().clone(),       Y_scalar, theta)
+                        next_from_big  = model(yhat_single_big.detach().clone(), Y_scalar, theta)
+                        Nr = dipole_from_links18(next_from_roll, offsets=sg_offsets)
+                        Nb = dipole_from_links18(next_from_big,  offsets=sg_offsets)
+                        rollout_single_loss = F.mse_loss(Nr, Nb)
+                        loss = loss + w_single * rollout_single_loss
+                        meters.add("train/rollout_single_cons", rollout_single_loss.detach(), base18.size(0))
+
+                    del yhat_roll, yhat_single_big
+                else:
+                    meters.add("train/rollout_state_cons",  torch.zeros((), device=base18.device), base18.size(0))
+                    meters.add("train/rollout_single_cons", torch.zeros((), device=base18.device), base18.size(0))
+
+
+
+#                 rollout_k = int(rollout_k_curr)
+#                 rollout_cons_w = float(cons_w)
+#                 if (base18.device.type == 'cpu') and bool(getattr(args,'skip_heavy_on_cpu', True)):
+#                     rollout_cons_w = 0.0
+
+#                 # rollout consistency regularizer (only if both enabled)
+#                 if (rollout_k > 1) and (rollout_cons_w > 0.0):
+#                     yhat_roll, yhat_single_big = rollout_predict(model, base18, Y_scalar, rollout_k, theta)
+#                     sg_offsets = getattr(args, "sg_dipole_offsets", None)
+#                     Nd = dipole_from_links18(yhat_single_big, offsets=sg_offsets)  # (B,K)
+#                     Nc = dipole_from_links18(yhat_roll,       offsets=sg_offsets)  # (B,K)
+#                     rollout_loss = F.mse_loss(Nd, Nc)
+# #                    cons = ((yhat_roll - yhat_single) ** 2).mean()
+#                     loss = loss + rollout_cons_w * rollout_loss
+#                     meters.add("train/rollout_cons", rollout_loss.detach(), base18.size(0))
+#                     del yhat_roll, yhat_single_big, rollout_loss
+#                 else:
+#                     # keep the metric stream consistent; log zero when disabled
+#                     meters.add("train/rollout_cons",
+#                                torch.zeros((), device=base18.device), base18.size(0))
+
+#                 # rollout-single consistency
+#                 if int(getattr(args, "rollout_k", 1)) > 1 and float(getattr(args, "rollout_consistency", 0.0)) > 0.0 and (yhat_single is not None):
+#                     cons = torch.mean((yhat_single - yhat) ** 2)
+#                     loss = loss + float(args.rollout_consistency) * cons
+#                     meters.add("train/rollout_cons", cons.detach(), base18.size(0))
 
                 # --- semigroup ---
                 # --- semigroup on dipoles instead of Wilson lines ---
@@ -4569,42 +4492,20 @@ def train(args):
                     
             # ---- accumulation-aware backward/step ----
             accum = int(args.accum)
+            loss_unscaled = loss                      # for meters/logging/comparisons
             if accum > 1:
-                loss = loss / accum
-            micro = (it - 1) % max(1, accum)
-            last_micro = (micro == max(1, accum) - 1)
-          
-            ddp_ctx = (model.no_sync() if (is_ddp and accum > 1 and not last_micro) else nullcontext())
+                loss = loss / accum                   # only for backward
 
-#            if torch.cuda.is_available():
-#                e["backward"][0].record()
-#            #----time----
-#            if torch.cuda.is_available(): torch.cuda.synchronize();
-#            t0=time.perf_counter()
-#            #----end-time----
+            micro      = (it - 1) % max(1, accum)
+            last_micro = (micro == max(1, accum) - 1)
+
+            ddp_ctx = (model.no_sync() if (is_ddp and accum > 1 and not last_micro) else nullcontext())
             with ddp_ctx:
                 if use_amp:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
- #           if torch.cuda.is_available():
- #               e["backward"][1].record()
-#            #----time----
-#            if torch.cuda.is_available(): torch.cuda.synchronize()
-#            print(f"[timing] backward: {(time.perf_counter()-t0)*1e3:.2f} ms")
-#            #----end-time----
-                                                    
-            # # --- record grad norms after backward for the monitor ---
-            # def _gnorm(params):
-            #     sq = 0.0
-            #     for p in params:
-            #         if (p.grad is not None):
-            #             sq += float((p.grad.detach()**2).sum())
-            #     return sq**0.5
-            # g_nll  = _gnorm(model.param_nll.parameters())
-            # g_core = _gnorm(p for n,p in model.named_parameters() if 'param_nll' not in n)
-       
             # One-off grads diagnostic after a backward happened
             if it == 1:
                 gnorm = _safe_unscale_and_grad_norm(opt, scaler, model)
@@ -4616,32 +4517,16 @@ def train(args):
 
             if last_micro:  # do the step on every rank
                 core = unwrap(model)
-
-                # (Optional) Δw/‖w‖ — rare, rank0-only
                 do_dw = (it <= 1) or (PROFILE_DW_EVERY and it % PROFILE_DW_EVERY == 0)
-                #do_dw = ((it <= 1) or (PROFILE_DW_EVERY and it % PROFILE_DW_EVERY == 0)) and (((not is_ddp) or dist.get_rank()==0))
                 if do_dw:
                     before_vec = flat_params(core)
 
-#                if torch.cuda.is_available():
-#                    e["step"][0].record()
-#                #----time----
-#                if torch.cuda.is_available(): torch.cuda.synchronize();
-#                t0=time.perf_counter()
-#                #----end-time----
                 if use_amp and getattr(scaler, 'is_enabled', lambda: False)():
                     # scaler.unscale_(opt)  # enable if you clip every step
                     scaler.step(opt); scaler.update()
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
-
- #               if torch.cuda.is_available():
- #                   e["step"][1].record()
-#                #----time----
-#                if torch.cuda.is_available(): torch.cuda.synchronize()
-#                print(f"[timing] step: {(time.perf_counter()-t0)*1e3:.2f} ms")
-#                #----end-time----
 
                 if ema is not None:
                     ema.update(core)
@@ -4687,10 +4572,10 @@ def train(args):
         #                 print(f"[step] ||Δw||/||w|| = {last_dw_ratio:.3e}")
 
             # ---- running stats ----
-            tr_sum += loss.detach().to(tr_sum.dtype)
+            tr_sum += loss_unscaled.detach().to(tr_sum.dtype)
             tr_cnt += 1
-            win_meter.update(loss.detach())
-            meters.add("train/total", loss.detach(), base18.size(0))
+            win_meter.update(loss_unscaled.detach())
+            meters.add("train/total", loss_unscaled.detach(), base18.size(0))
 
             # Throttled logging
             if (it % LOG_EVERY == 0) and (((not is_ddp) or dist.get_rank()==0)):
@@ -5556,8 +5441,6 @@ def main():
     ap.add_argument("--nll_weight", type=float, default=0.0, help="Weight for alpha-true diagonal Gaussian NLL (0 disables).")
     ap.add_argument("--nll_target_mode", type=str, default="none", choices=["per_dy","per_ysigma","none"], help="How to scale S to match head’s μ-space.")
     ap.add_argument("--quad_weight", type=float, default=0.0, help="Weight for quadrupole loss.")
-    ap.add_argument("--loops_rects", type=str, default="(1,1),(1,2),(2,2)", help="Rectangles (a,b).")
-    ap.add_argument("--loops_weight", type=float, default=0.0, help="Weight for Wilson loop loss.")    
     ap.add_argument("--rough_weight", type=float, default=0., help="Weight for fluctuation scale loss.")
     ap.add_argument("--kmin", type=float, default=4., help="Minimum k for which to include fluctuations.")
     ap.add_argument("--kmax", type=float, default=None, help="Max k for fluctuation scale loss.")
@@ -5569,6 +5452,7 @@ def main():
     # Rollout & Consistency
     ap.add_argument("--rollout_k", type=int, default=1, help='Number of uniform substeps in Y for autoregressive rollout. If >1, the model is applied k times starting from U0 with intermediate Y_i = Y_final*(i/k), encouraging learning of the Y trajectory (not just the endpoint). Set to 1 to disable rollout and use single-shot predictions. Typical values: 3–8.')
     ap.add_argument("--rollout_consistency", type=float, default=0.0, help='Weight for an auxiliary MSE between single-shot output F(Y, U0) and rollout output after k substeps. Helps the network keep the single-shot and multi-step operators consistent. Use together with --rollout_k>1. Recommended range: 0.05–0.2.')
+    ap.add_argument("--rollout_single_consistency", type=float, default=0.0, help='Weight for SINGLE consistency: match one-step transitions from the two states that rollout produces.')
     ap.add_argument("--semigroup_weight", type=float, default=0.0, help='Weight for the semigroup consistency loss enforcing F(Y2, F(Y1, U0)) ≈ F(Y1+Y2, U0) on random splits Y1/Y2. Adds two extra forward passes on selected batches. Small but strong physics prior. Try 0.01–0.05.')
     ap.add_argument("--semigroup_prob", type=float, default=0.0, help='Probability (0–1) of applying the semigroup consistency term on a given batch. Use <1.0 to control extra compute overhead. Example: 0.25 (apply on 25% of batches).')
     ap.add_argument("--qs_soft_beta", type=float, default=0.0,
@@ -5614,7 +5498,7 @@ def main():
     ap.add_argument("--poly_power", type=float, default=1.0,
                     help="Power for polynomial LR decay (poly).")
 
-    ap.add_argument('--y_map', type=str, default='tanh',
+    ap.add_argument('--y_map', type=str, default='linear',
                     choices=['tanh','linear'],
                     help='Map from physical Y to internal Y_eff')
 

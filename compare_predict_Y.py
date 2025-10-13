@@ -910,7 +910,7 @@ def avg_gen_stats(U_pred, Uy_true, U0, Y):
 
 
 # ---------- prediction ----------
-def predict_Uy(model, U0, Y, params, device):
+def predict_Uy(model, U0, Y, params, device, sample = False):
     """
     Build [1,22,H,W] input for the model and return raw prediction as numpy [H,W,18].
     - U0: complex ndarray [H,W,3,3] (baseline field)
@@ -989,11 +989,12 @@ def predict_Uy(model, U0, Y, params, device):
 #    y01 = model._y_scalar01(torch.from_numpy(x22).unsqueeze(0)).item()
     print("[debug] normalized y01=", y01)
 
-    
+    if sample == True:
+        print("sampling!")
     model.eval()
     with torch.no_grad():
         base18, Y_scalar, theta = split_legacy_x(x)
-        yhat = model(base18, Y_scalar, theta)  # [1,18,H,W]
+        yhat = model(base18, Y_scalar, theta, sample)  # [1,18,H,W]
 
 
         #     # quick movement check before any projection/repair
@@ -1282,12 +1283,12 @@ def main():
     # print("[head] adjusted alpha_scale ->", model.head.alpha_scale)
 
     # # 4) now run the REAL prediction at the calibrated gain
-    y18_raw = predict_Uy(model, U0, Y, params, device=device)
+    y18_raw = predict_Uy(model, U0, Y, params, device=device, sample=True)
 
     # === Y-sensitivity at your chosen Y* versus Y=0 (single-sample sanity) ===
 
     # Forward once more at Y=0 using the same U0 and params
-    y18_raw_0 = predict_Uy(model, U0, 0.0, params, device=device)
+    y18_raw_0 = predict_Uy(model, U0, 0.0, params, device=device, sample=True)
 
     # Repair non-finite, pack to complex, and project to SU(3)
     Uy_pred = svd_polar_det1(pack_to_complex(y18_repair(y18_raw)))     # at Y*
@@ -1371,8 +1372,8 @@ def main():
     eps = 0.04  # feel free to tweak smaller/larger; must fit in your Y-range
     Y_minus = max(0.0, Y - eps)
     Y_plus  = Y + eps
-    y18_m = predict_Uy(model, U0, Y_minus, params, device=device)
-    y18_p = predict_Uy(model, U0, Y_plus,  params, device=device)
+    y18_m = predict_Uy(model, U0, Y_minus, params, device=device, sample=True)
+    y18_p = predict_Uy(model, U0, Y_plus,  params, device=device, sample=True)
     U_pred_m = svd_polar_det1(pack_to_complex(y18_repair(y18_m)))
     U_pred_p = svd_polar_det1(pack_to_complex(y18_repair(y18_p)))
     Qs_m, _, segm_r, segm_n = qs_from_axial_np_thr(U_pred_m, thr=0.5)
@@ -1392,8 +1393,8 @@ def main():
         capt.setdefault('a', []).append(output.detach().cpu().numpy())  # [B,8,H,W]
 
     h = model.head.proj_mu.register_forward_hook(_hook_proj_mu)
-    _ = predict_Uy(model, U0, 0.0,      params, device=device)
-    _ = predict_Uy(model, U0, float(Y), params, device=device)
+    _ = predict_Uy(model, U0, 0.0,      params, device=device, sample=True)
+    _ = predict_Uy(model, U0, float(Y), params, device=device, sample=True)
     h.remove()
 
     
@@ -1414,7 +1415,7 @@ def main():
     Ys_test = [0.25*Y, 0.5*Y, 1.0*Y]
     moves = []
     for Yk in Ys_test:
-        y18_k = predict_Uy(model, U0, float(Yk), params, device=device)
+        y18_k = predict_Uy(model, U0, float(Yk), params, device=device, sample = True)
         Uk = svd_polar_det1(pack_to_complex(y18_k))
         moves.append(_mean_move(Uk, U0))
     print("[linearity] (Y, mean|U(Y)-U0|):", list(zip([float(y) for y in Ys_test], moves)))
