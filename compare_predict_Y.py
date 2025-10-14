@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # --- Must match your training run
 OFFSETS = [(1,0),(0,1),(2,0),(0,2),(4,0),(0,4),(8,0),(0,8),(12,0),(0,12),(16,0),(0,16)]
@@ -474,8 +475,6 @@ def safe_load_model(ckpt_path: Path, device: str = "cpu"):
     model = EvolverFNO(**kwargs).to(device)
     model.load_state_dict(ckpt["model"], strict=False) #model.load_state_dict(ckpt["model"])
     model.eval()
-
-
 
     
     # try:
@@ -996,7 +995,20 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
         base18, Y_scalar, theta = split_legacy_x(x)
         yhat = model(base18, Y_scalar, theta, sample=sample)  # [1,18,H,W]
 
-
+        # inside main(), AFTER you build base18, Y_scalar, theta
+        core = model.module if hasattr(model, "module") else model
+        with torch.no_grad():
+            # either call the trunk explicitly...
+            h = model.encode_trunk_from_components(base18, Y_scalar, theta)
+            logsig = core.head.proj_logs(h)
+            sigma_raw   = F.softplus(logsig)
+            sigma_final = sigma_raw + core.head.sigma_floor
+        print("infer σ_raw   mean/min/max:",
+              float(sigma_raw.mean()), float(sigma_raw.min()), float(sigma_raw.max()))
+        print("infer σ_final mean/min/max:",
+              float(sigma_final.mean()), float(sigma_final.min()), float(sigma_final.max()))
+        print("sigma_floor in predictor:", float(core.head.sigma_floor))
+        
         #     # quick movement check before any projection/repair
     #     try:
     #         base18 = x22[:18]  # [18,H,W]
@@ -1199,7 +1211,7 @@ def main():
     print(f"[debug] using y_min={y_min_data:.6g}, y_max={y_max_data:.6g}")
 
 
-    
+   
     # U0 (smallest steps) + params (NO g2mua)
     snaps = sorted(man["snapshots"], key=lambda s: int(s["steps"]))
     s0 = snaps[0]
