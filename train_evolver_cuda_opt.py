@@ -1088,7 +1088,7 @@ class SU3HeadGellMannStochastic(nn.Module):
                  alpha_scale: float | None = 1.,     # per-pixel L2 cap (recommended)
                  alpha_vec_cap: float | None = 15.,   # per-pixel L2 cap (recommended)
                  A_cap: float | None = None,         # or cap in matrix space
-                 sigma0: float = 0.01,                # init noise scale
+                 sigma0: float = 0.1,                # init noise scale
                  sigma_mode: str | None = None,
                  noise_kernel: int | None = None,
                  #sigma_mode: str = "conv",          # "diag" (current), "conv", or "spectral"
@@ -1101,11 +1101,8 @@ class SU3HeadGellMannStochastic(nn.Module):
         # Init
         nn.init.xavier_uniform_(self.proj_mu.weight, gain=1e-2)
         nn.init.constant_(self.proj_mu.bias, 0.0)
-        nn.init.xavier_uniform_(self.proj_logs.weight, gain=1e-2)
-        nn.init.constant_(self.proj_logs.bias, math.log(sigma0))
-
-#        nn.init.constant_(self.proj_logs.weight, 0.0)
-#        nn.init.constant_(self.proj_logs.bias, float(math.log(sigma0)))
+        nn.init.constant_(self.proj_logs.weight, 0.0)
+        nn.init.constant_(self.proj_logs.bias, float(math.log(sigma0)))
 
         self.identity_eps   = float(identity_eps)
         self.alpha_scale    = float(alpha_scale)
@@ -1118,9 +1115,9 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.gamma1 = nn.Parameter(torch.tensor(0.0,  dtype=torch.float32))
         self.kappa  = nn.Parameter(torch.tensor(6.0,  dtype=torch.float32))
 
-        # # make initial noise gentle (overrides sigma0 above intentionally)
-        # if hasattr(self, "proj_logs") and getattr(self.proj_logs, "bias", None) is not None:
-        #     torch.nn.init.constant_(self.proj_logs.bias, -4.6)
+        ## make initial noise gentle (overrides sigma0 above intentionally)
+        #if hasattr(self, "proj_logs") and getattr(self.proj_logs, "bias", None) is not None:
+        #    torch.nn.init.constant_(self.proj_logs.bias, -4.6)
 
         self.projL = nn.Conv2d(width, 8, kernel_size=1)  # α_L^a
         self.projR = nn.Conv2d(width, 8, kernel_size=1)  # α_R^a
@@ -1159,7 +1156,7 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         self.C = C
         self.sigma_floor = 0.
-        init_sigma = 0.1
+        init_sigma = 0.03
         # mu_head: width -> C
         self.mu_head    = nn.Conv2d(self.width, C, kernel_size=1, bias=True)        
         # σ head: C -> C   (because you call sigma_head(mu))
@@ -1227,7 +1224,6 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.last_A_fro_mean = (S.real.square().sum(dim=(-2,-1)).sqrt().mean()).detach()
         return A, S
 
-    #only works for nsamples=1 when sampling
     def forward(self, h: torch.Tensor, base18: torch.Tensor, Ymap: torch.Tensor,
                 nsamples: int = 1, sample: bool | None = None, dY=None) -> torch.Tensor:
         # Optional fast exit at Y≈0
@@ -1245,18 +1241,9 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         #mu = self.mu_head(h)                  # [B, C, H, W]
         mu     = self.proj_mu(h).float()        # [B, C, H, W], C in {8,16}
-        #sigma_logits = self.sigma_head(mu)    # [B, C, H, W]  <- now channels match
-        #sigma_amp = self.sigma_floor + F.softplus(sigma_logits)
+        sigma_logits = self.sigma_head(mu)    # [B, C, H, W]  <- now channels match
 
         logsig = self.proj_logs(h).float()      # [B, C, H, W]
-
-        # NEW: physical diffusion amplitude (scalar field per pixel)
-        amp = F.softplus(self.amp_head(h)).float()      # [B,1,H,W] ≥ 0
-        self.last_amp = amp
-
-
-        y_raw  = Ymap[:, 0, :, :]                  # physical Y
-        dy_map = dY[:, 0, :, :] if dY is not None else y_raw  # prefer ΔY if caller gave it
 
         y_eff = Ymap[:, 0, :, :].to(mu.real.dtype)                 # [B,H,W]
 
@@ -1265,14 +1252,22 @@ class SU3HeadGellMannStochastic(nn.Module):
         y_sigma = y_eff.unsqueeze(1)                 # [B,1,H,W]    (real)
 
         # σ(Y) = y_eff * softplus(logσ̂)  (vanishes at Y=0, nonzero for Y>0 batches)
-        sigma = (F.softplus(logsig) + self.sigma_floor).clamp_max(1.0)  # use same cap as NLL
         #sigma = y_sigma * F.softplus(logsig)
+        sigma = F.softplus(logsig)
 
-
-#        print("sigma=",F.softplus(logsig))
         self.last_mu = mu
         self.last_logsig = logsig
+        self.last_y_sigma = y_sigma
 
+
+        # with torch.no_grad():
+        #     mu_rms = mu.pow(2).mean().sqrt().item()
+        #     s = self.sigma_floor + F.softplus(self.sigma_head(mu))
+        #     s_rms = s.pow(2).mean().sqrt().item()
+        #     print(f"[debug2] mu_rms={mu_rms:.3e}  sigma_mean={s.mean().item():.3e}  sigma_rms={s_rms:.3e}")
+
+        gain  = self.kappa * F.softplus(self.gamma0 + self.gamma1 * y)      # [B,H,W,1,1]
+        gain_coef = gain[..., 0, 0].unsqueeze(1).to(mu.dtype)               # [B,1,H,W]
         # Sampling
         if sample:
             epsn = torch.randn_like(mu)  # [B,C,H,W]
@@ -1300,42 +1295,83 @@ class SU3HeadGellMannStochastic(nn.Module):
             # --- normalize eta_core to unit RMS (detach denom to avoid weird grads)
             den = eta_core.pow(2).mean(dim=(2,3), keepdim=True).add(1e-12).sqrt().detach()
             eta_core = eta_core / den
-         
-#            print("SAMPLING!")
-            
-            # overall learnable gain + per-pixel amplitude
-#            eta = self.op_gain * amp * eta_core   # (was sigma_amp)
 
-            sigma_for_sampling = sigma.detach() if self.training else sigma
-            eta = sigma_for_sampling * eta_core
-#            eta = sigma * eta_core
+            # overall learnable gain + per-pixel amplitude
+            eta = sigma * eta_core   # (was sigma_amp)
+
             
             B = base18.shape[0]
             if dY is None:
                 # default to per-unit step if caller didn't supply it
-                dY = torch.ones(B, device=base18.device, dtype=base18.dtype)
-                dY = dY.view(B, 1, 1, 1)
-
-            # mu_step  = mu  * dY            # μ ΔY
-            # eta_step = eta * torch.sqrt(dY)  # s √ΔY
-            # a_all    = mu_step + eta_step     # (was mu + eta)
-            
-            mu_step  = mu # self._cap_alphas(mu) # CHECK  
-            eta_step = eta
+                dY = y_sigma
+                
+           # mu_step  = mu  * dY            # μ ΔY
+           # eta_step = eta * torch.sqrt(dY)  # s √ΔY
+            mu_step  = mu  * dY            # μ ΔY
+            eta_step = eta * torch.sqrt(dY)#torch.sqrt(dY)  # s √ΔY
+            #a_all    = gain_coef * mu_step + eta_step
             a_all    = mu_step + eta_step     # (was mu + eta)
-
+            
             # debug hooks
             self.last_sigma_mode = self.sigma_mode
             self.last_eta_rms = eta.detach().pow(2).mean()
-            self.last_sigma_mean = sigma.detach().mean()
+            self.last_sigma_mean = sigma.detach().mean()  # alias to amp for compat
             self.last_sigma_min  = sigma.detach().min()
             self.last_sigma_max  = sigma.detach().max()
-        else:
-            a_all = mu #self._cap_alphas(mu)
-            # # σ(Y) = y_eff * softplus(logσ̂)  => vanishes at Y=0 and grows smoothly
-            # sigma = y_sigma * F.softplus(logsig)
-            self.last_sigma_mean = sigma.mean().detach()
             
+            # if self.sigma_mode == "diag":
+            #     eta = sigma * epsn
+
+            # elif self.sigma_mode == "conv":
+            #     # Operator Bθ: depthwise k×k conv + 1×1 color mixer
+            #     # Note: keep amplitude control via your existing sigma map
+            #     eta = self.noise_pw(self.noise_dw(epsn))
+            #     eta = sigma * eta
+
+            # elif self.sigma_mode == "spectral":
+            #     # Build a per-frequency radial gain G_c(|k|) = 1 / (1 + (|k|/k0)^p)
+            #     B, C, H, W = mu.shape
+            #     Ef = torch.fft.rfft2(epsn, norm="ortho")  # [B,C,Hf,Wf] complex
+            #     # normalized freq grid in cycles/pixel
+            #     ky = torch.fft.rfftfreq(H, d=1.0).to(Ef.device)  # [Hf]
+            #     kx = torch.fft.rfftfreq(W, d=1.0).to(Ef.device)  # [Wf]
+            #     Ky = ky.view(-1, 1).expand(H//2+1, W//2+1)
+            #     Kx = kx.view(1, -1).expand(H//2+1, W//2+1)
+            #     Kr = torch.sqrt(Kx**2 + Ky**2)  # [Hf,Wf], real
+            #     k0 = torch.clamp(self.spec_k0, min=1e-3).view(1, C, 1, 1)
+            #     p  = torch.relu(self.spec_p).view(1, C, 1, 1)
+            #     # broadcast radial profile to channels
+            #     G = (1.0 / (1.0 + (Kr.view(1,1,*Kr.shape) / k0)**p)).to(Ef.dtype)  # [1,C,Hf,Wf]
+            #     Ef_filt = Ef * G
+            #     eta = torch.fft.irfft2(Ef_filt, s=(H, W), norm="ortho")
+            #     eta = sigma * eta
+
+            # else:
+            #     raise ValueError(f"Unknown sigma_mode: {self.sigma_mode}")
+
+            # a_all = mu + eta
+
+            # # # σ(Y) = y_eff * softplus(logσ̂)  => vanishes at Y=0 and grows smoothly
+            # # sigma = y_sigma * F.softplus(logsig)
+            # #self.last_sigma_mean = sigma.mean().detach()
+            # self.last_sigma_mean = eta.abs().mean().detach()
+
+            # self.last_sigma_mode = self.sigma_mode
+            # self.last_eta_rms = eta.detach().square().mean()
+            # # epsn = torch.randn_like(mu)
+            # a_all = mu + sigma * epsn
+        else:
+            B = base18.shape[0]
+            if dY is None:
+                # default to per-unit step if caller didn't supply it
+                dY = y_sigma
+                
+            #a_all = gain_coef * (mu) # * dY)
+            a_all = mu * dY#* dY
+            # # σ(Y) = y_eff * softplus(logσ̂)  => vanishes at Y=0 and grows smoothly
+            sigma = F.softplus(logsig)
+            self.last_sigma_mean = sigma.mean().detach()
+
         # Split into Left/Right sets
         if C == 16:
             aL, aR = torch.split(a_all, 8, dim=1)    # each [B,8,H,W]
@@ -1353,18 +1389,12 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         # Gain schedule s(Y) = kappa * softplus(gamma0 + gamma1 * y_eff)
         # (real, >=0, broadcast-friendly)
-
-        gain   = self.kappa * F.softplus(self.gamma0 + self.gamma1 * y)
-        scale  = y * gain                                     # scale ~ O(ΔY)
-        AeffL  = scale * AL * self.dy_calib(y)                # calibrate on ΔY, not on “scale”
-        AeffR  = scale * AR * self.dy_calib(y)
-
-#        gain  = self.kappa * F.softplus(self.gamma0 + self.gamma1 * y)  # [B,H,W,1,1]
-#        scale = y * gain                                                # [B,H,W,1,1], real
+        #gain  = self.kappa * F.softplus(self.gamma0 + self.gamma1 * y)  # [B,H,W,1,1]
+        #scale = gain                                                # [B,H,W,1,1], real
 
         # Effective generators; real 'scale' broadcasts over complex matrices
-#        AeffL = scale * AL * self.dy_calib(scale)  
-#        AeffR = scale * AR * self.dy_calib(scale)  
+        AeffL = AL #scale * AL #* self.dy_calib(scale)  
+        AeffR = AR #scale * AR #* self.dy_calib(scale)  
 
         # Strang composition
         GLh = torch.linalg.matrix_exp(-0.5 * AeffL)
@@ -1379,13 +1409,19 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         # Optional identity snap at Y≈0 using *physical* Y (not rescaled)
         if eps > 0.0:
-#            y_abs0 = y_raw[:, 0, 0].abs()
-            y_abs0 = Ymap[:, 0, 0, 0].abs()  # physical Y
+            # Ymap is constant over H,W per sample; take a representative element
+            y_abs0 = Ymap[:, 0, 0, 0].abs()
             if (y_abs0 <= eps).any():
                 mask = (y_abs0 <= eps)
                 out18 = out18.clone()
                 out18[mask] = base18[mask]
 
+        # if eps > 0.0:
+        #     y_abs0 = y_raw[:, 0, 0].abs()
+        #     if (y_abs0 <= eps).any():
+        #         mask = (y_abs0 <= eps)
+        #         out18 = out18.clone()
+        #         out18[mask] = base18[mask]
                 
         return out18
 
@@ -1743,33 +1779,21 @@ class EvolverFNO(nn.Module):
         return h
 
 
-    # --- clean API: components in, SU(3) out ---
-    def forward(self, base18, Y_scalar, theta, *,
-                sample: bool | None = None,
-                nsamples: int = 1,
-                dY=None):
+    def forward(self, base18: torch.Tensor,
+                       Y_scalar: torch.Tensor,
+                       theta: torch.Tensor,
+                       *,
+                       sample: bool | None = None,
+                       nsamples: int = 1,
+                       dY=None) -> torch.Tensor:
         B, _, H, W = base18.shape
         h = self.encode_trunk_from_components(base18, Y_scalar, theta)
+        dYmap = None
+        if dY is not None:
+            dYmap = dY.view(B, 1, 1, 1).expand(B, 1, H, W)
+        # Broadcast physical Y to a per-pixel map for the head
         Ymap = Y_scalar.view(B, 1, 1, 1).expand(B, 1, H, W)
-        if dY is None:
-            dYmap = Ymap                   # falls back to absolute Y (keeps old behavior)
-        else:
-            dYmap = dY.view(B,1,1,1).expand(B,1,H,W)
-
         return self.head(h, base18, Ymap, nsamples=nsamples, sample=sample, dY=dYmap)
-        #return self.head(h, base18, Ymap, nsamples=nsamples, sample=sample, dY=dY)
-
-
-
-
-    # def forward(self, base18: torch.Tensor,
-    #                        Y_scalar: torch.Tensor,
-    #                        theta: torch.Tensor) -> torch.Tensor:
-    #     B, _, H, W = base18.shape
-    #     h = self.encode_trunk_from_components(base18, Y_scalar, theta)
-    #     # Build a Y "map" on-the-fly for the head (broadcast; no dataset storage)
-    #     Ymap = Y_scalar.view(B,1,1,1).expand(B,1,H,W)
-    #     return self.head(h, base18, Ymap)
 
 def _reduce(x: torch.Tensor, reduction: str):
     if reduction == "mean":
@@ -2223,7 +2247,7 @@ class GroupLossWithQs(GroupLoss):
                 # You can add others similarly
             })
         self._lams_cached = None
-        self.nll_stride = 2
+        self.nll_stride = 1
         self.I3 = torch.eye(3, dtype=torch.cfloat)
         self.moment_weight = float(moment_weight)        
         print("[loss cfg] dipole_w=", self.dipole_weight, "qs_w=", self.qs_weight, "tr_w=", self.w_trace,
@@ -2906,10 +2930,17 @@ class GroupLossWithQs(GroupLoss):
                 # replace raw MSE in variance with a log-ratio penalty (scale-invariant):
                 log_ratio = torch.log((mm_v_pred + eps) / (mm_v_true + eps))
                 moment_var_term = (log_ratio ** 2).mean()   # replaces any v_pred-v_true term
-                
+
+                # # For the variance term, do not let it move the drift/mean:
+                # resid_m2      = (a_true_mm.detach() - drift.detach() * dY_mm)  # stop μ grads for m2
+                # v_true_map_m2 = resid_m2.pow(2).mean(dim=1, keepdim=True)
+                # m2 = (torch.log(v_pred_map + eps) - torch.log(v_true_map_m2 + eps)).pow(2).mean()
+
+    
                 # (keep your first-moment term if you like, but weight it lightly)
+                #moment_loss = 0.25 * m1 + 0.25 * m2 + 0.75 * moment_var_term
                 moment_loss = 0.25 * m1 + moment_var_term
-                
+                #moment_loss = 0.25 * m1 + m2
                 
                 #loss_moment = m1_w * m1 + m2_w * m2
                 total = total + float(self.moment_weight) * moment_loss
@@ -2951,7 +2982,7 @@ class GroupLossWithQs(GroupLoss):
         ##----end-time----
         a_true = None
         # --- NLL on α (projected generator) -----------------------------------
-        if (base18 is not None) \
+        if (self.nll_weight != 0.0) and (base18 is not None) \
            and (mu_pred is not None) and (logsig_pred is not None):
 
             with torch.no_grad():
@@ -2962,7 +2993,7 @@ class GroupLossWithQs(GroupLoss):
                 lams = self.lambdas.to(device=U0.device, dtype=U0.dtype)  # or cached getter
 
                 # (A)+(B): fast log with stride + eig only on outliers
-                stride = getattr(self, "nll_map_stride", 2)
+                stride = getattr(self, "nll_map_stride", 1)
                 a_true = self._alpha_map_from_pair(
                     U0, U1, lams, stride=stride, fast_thresh=getattr(self, "nll_fast_thresh", 0.15), proj_iters=1
                 )  # [B,C',H',W']
@@ -2977,52 +3008,48 @@ class GroupLossWithQs(GroupLoss):
                 if a_true.shape[1] != C:
                     a_true = a_true[:, :C]  # or mirror only if you must
 
-            sigma_floor, sigma_cap = 0. , 1.0
+           
+#           sigma = (F.softplus(logsig_pred) + sigma_floor).clamp_max(sigma_cap)
 
-            #     # ---- DE-SCALE a_true to the same units as mu_pred (per-unit-Y) ----
-            # # Requires a pointer to the head (set once in train(): criterion.nll_head_ref = model.head)
-            # head = getattr(self, "nll_head_ref", None)
-            # if head is not None and (Y_final is not None):
-            #     # Y_final is [B], physical Y used in the head; rebuild the exact scale
-            #     y = Y_final.view(-1, 1, 1, 1).to(a_true.dtype)                       # [B,1,1,1]
-            #     gain  = head.kappa * F.softplus(head.gamma0 + head.gamma1 * y)       # [B,1,1,1]
-            #     scale = y * gain                                                      # [B,1,1,1]
-            #     # match the head’s delta-Y calibration
-            #     scale_cal = head.dy_calib(scale) * scale                              # [B,1,1,1]
-            #     # broadcast to [B,1,H,W] and divide
-            #     a_true = a_true / (scale_cal.expand(a_true.size(0), 1, a_true.size(2), a_true.size(3)) + 1e-8)
-            # # else: if you later compose μ/Σ to Y with a param composer, keep 'none' (integrated units)
+            B, C, H, W = mu_pred.shape
 
+            # Build a broadcastable step-size map: [B,1,1,1]
+            dY_map = dy_scalar.to(mu_pred.dtype).to(mu_pred.device).view(B, 1, 1, 1)
 
-            eps = 1e-6
-            resid = mu_pred - a_true
-            sigma = (F.softplus(logsig_pred) + sigma_floor).clamp_max(sigma_cap)
+            # Per-step drift and per-step sigma (to match your sampling: η_step = σ * √dY)
+            mu_step    = mu_pred * dY_map                      # [B,C,H,W]
+            sigma_unit = F.softplus(logsig_pred)               # [B,C,H,W]
+            sigma_step = (sigma_unit * dY_map.sqrt()).clamp_min(1e-12)
 
+            # Residual and NLL on the *per-step* quantities
+            resid = mu_step - a_true                           # a_true is the step-integrated α
 
-            with torch.no_grad():
-                sigma_ml = resid.pow(2).mean(dim=0).sqrt()  # [C,H,W] averaged over batch
-                print("⟨σ_pred⟩=", float(sigma.mean()), " ⟨σ_ml⟩=", float(sigma_ml.mean()))
+            w_log = getattr(self, "nll_logsigma_weight", 1.0)  # >1 shrinks σ harder
+            nll = 0.5 * (resid / sigma_step)**2 + w_log * torch.log(sigma_step)
             
-            # if getattr(self, "current_epoch", 0) < 3:
-            #     sigma_eff = sigma.detach()
-            # else:
-            #     sigma_eff = sigma
-
-            # print("sigma=",sigma_eff)
-
- 
-           # baseline = math.log(sigma_floor) +  0.5 * math.log(2.0*math.pi)
-            baseline = 0.5 * math.log(2.0*math.pi)
-            nll = 0.5 * (resid / (sigma + eps))**2 + torch.log(sigma + eps) + 0.5*math.log(2.0*math.pi)
+#            nll = 0.5 * (resid / sigma_quad)**2 + torch.log(sigma_log)
             loss_nll = nll.mean()
-            total = total + self.nll_weight * loss_nll  # DO NOT negate
+            
+            total    = total + self.nll_weight * loss_nll
 
 
-            log_sigma = torch.log(sigma + 1e-12).mean(dim=1, keepdim=True)  # [B,1,H,W]
-            tv = (log_sigma[:, :, :, 1:] - log_sigma[:, :, :, :-1]).abs().mean() + \
-                (log_sigma[:, :, 1:, :] - log_sigma[:, :, :-1, :]).abs().mean()
-            lambda_tv = 1e-3
-            total = total + lambda_tv * tv
+            
+            # sigma_ref = getattr(self, "nll_sigma_ref", 0.2)                 # tune: 0.05–0.5
+            # w_prior   = getattr(self, "nll_sigma_prior_weight", 1e-3)       # tune: 1e-4–1e-2
+            # nll = nll + w_prior * (torch.log(sigma_log) - math.log(sigma_ref))**2
+
+            # loss_nll = nll.mean()
+            # total = total + self.nll_weight * loss_nll
+            
+          #  baseline = math.log(sigma_floor) + 0.5 * math.log(2.0*math.pi)
+            #nll = 0.5 * (resid / sigma)**2 + torch.log(sigma) 
+            #nll = 0.5 * (resid / sigma)**2 + getattr(self, "nll_logsigma_weight", 0.25) * torch.log(sigma)
+
+
+            # with torch.no_grad():
+            #     resid_c = resid - resid.mean()
+            #     sigma_ml = resid_c.pow(2).mean(dim=0).sqrt()  # [C,H,W] averaged over batch
+            #     print("⟨σ_pred⟩=", float(sigma.mean()), " ⟨σ_ml⟩=", float(sigma_ml.mean()))            
 
         #         if (self.nll_weight != 0.0) and (base18 is not None) \
 #            and (mu_pred is not None) and (logsig_pred is not None):
@@ -3226,7 +3253,7 @@ class GroupLossWithQs(GroupLoss):
 #        #----end-time----
 
         # 2) Full-cov α-NLL on spatial average (requires composer & θ)                                                                                                                                  
-        if getattr(self, 'use_fullcov', False) \
+        if (self.nll_weight != 0.0) and getattr(self, 'use_fullcov', False) \
            and hasattr(self, 'param_nll') and (theta is not None) and (a_true_bar is not None):
             B, C = a_true_bar.shape
             # Match channels if model uses 16-ch α basis: duplicate 8->16                                                                                                                               
@@ -3239,16 +3266,15 @@ class GroupLossWithQs(GroupLoss):
             CovY  = self.param_nll.cov_to_Y(L, kappa, Yv)                   # [B,C,C]                                                                                                                   
             # Cholesky of CovY (jitter for numerical safety)                                                                                                                                            
             eyeC = torch.eye(C, device=CovY.device, dtype=CovY.dtype).unsqueeze(0).expand(B,-1,-1)
-            sigma_floor = 1e-6 #1e-2  # match your diagonal case
+            sigma_floor = 1e-2  # match your diagonal case
             L_Y = torch.linalg.cholesky(CovY + (sigma_floor**2) * eyeC)
             resid = (a_true_bar - muY).unsqueeze(-1)                        # [B,C,1]                                                                                                                   
             # Solve Σ^{-1} resid via cholesky_solve                                                                                                                                                     
             sol = torch.cholesky_solve(resid, L_Y)                          # [B,C,1]                                                                                                                   
             maha = (resid.transpose(1,2) @ sol).squeeze(-1).squeeze(-1)     # [B]                                                                                                                       
             logdet = 2.0 * torch.log(torch.diagonal(L_Y, dim1=-2, dim2=-1)).sum(-1)
-            #logdet_shift = logdet - C * math.log(sigma_floor**2)  # = log det(Σ / σ_floor^2 I) ≥ 0                                                                                                      
-            #logdet_shift = logdet - C * math.log(sigma_floor**2)  # = log det(Σ / σ_floor^2 I) ≥ 0                                                                                                      
-            loss_nll_full = 0.5 * (5. * maha + logdet)   # (scale_maha = 5.0 in your code)                                                                                                        
+            logdet_shift = logdet - C * math.log(sigma_floor**2)  # = log det(Σ / σ_floor^2 I) ≥ 0                                                                                                      
+            loss_nll_full = 0.5 * (5. * maha + logdet_shift)   # (scale_maha = 5.0 in your code)                                                                                                        
             loss_nll_full = loss_nll_full.mean()
             total = total + self._wb('nll', loss_nll_full, self.nll_weight)
 
@@ -3748,13 +3774,13 @@ def rollout_predict(model, base18, Y_scalar, k, theta,
                     device_type="cuda", amp_dtype=torch.bfloat16, use_amp=True):
     # 1 big step: keep grads (we often compute loss on this)
     with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-        y_single = model(base18, Y_scalar * k, theta)
+        y_single = model(base18, Y_scalar * k, theta, sample=False, dY=Y_scalar * k)
 
     # k small steps: no grads, no version counters (saves a lot of memory)
     with torch.inference_mode(), torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
         base_curr = base18
         for _ in range(k):
-            base_curr = model(base_curr, Y_scalar, theta)
+            base_curr = model(base_curr, Y_scalar, theta, sample=False, dY=Y_scalar)
     y_roll = base_curr  # already detached
     return y_roll, y_single
 
@@ -3802,7 +3828,7 @@ def semigroup_compose(model, base18, Y_a, Y_b, theta):
     """
     # First step of size Y_a from the original base
 #    u_a = model.forward(base18, Y_a, theta)      # predicted links after Y_a
-    u_a = model(base18, Y_a, theta)
+    u_a = model(base18, Y_a, theta, sample=False)
     # IMPORTANT: turn the first prediction into the next "base"
     # If your head outputs exactly the 18-channel link representation (usual case),
     # this is just the prediction itself. If your head outputs more than 18 channels,
@@ -3813,11 +3839,11 @@ def semigroup_compose(model, base18, Y_a, Y_b, theta):
         base_after_a = u_a[:, :18, ...]  # adjust if your layout differs
 
     # Second step of size Y_b from the intermediate state
-    u_b_then_a = model(base_after_a, Y_b, theta)
+    u_b_then_a = model(base_after_a, Y_b, theta, sample=False)
     #u_b_then_a = model.forward(base_after_a, Y_b, theta)
 
     # One single step of size (Y_a + Y_b) from the original base
-    u_ab = model(base18, Y_a + Y_b, theta)
+    u_ab = model(base18, Y_a + Y_b, theta, sample=False)
     #u_ab = model.forward(base18, Y_a + Y_b, theta)
 
     return u_b_then_a, u_ab
@@ -4102,11 +4128,10 @@ def train(args):
             tb = tb.to(device, non_blocking=True)
             model.eval()
             with torch.no_grad():
-                _ = model(xb[:1], yb[:1], tb[:1])    # materialize all Lazy params
+                _ = model(xb[:1], yb[:1], tb[:1], sample=False)    # materialize all Lazy params
                 model.train()
                 model = model.to(memory_format=torch.channels_last)
-                
-                
+    
 # #    if torch.cuda.is_available():
 # #        model = torch.compile(model, mode="reduce-overhead")   # great for backward
 
@@ -4280,7 +4305,7 @@ def train(args):
             quad_pairs = tuple(tmp[:max_qp])
 
         criterion = GroupLossWithQs(
-            w_frob=0., w_unit=0.,
+            w_frob=0., w_unit=0.01,
             geo_weight=w_geo, dir_weight=w_dir, w_trace=w_tr,
             dipole_weight=w_dip, dipole_offsets=dipole_offsets,
             qs_weight=w_qs, qs_threshold=0.5, qs_on='N', qs_local=True,
@@ -4313,9 +4338,6 @@ def train(args):
             setattr(criterion, 'energy_weight', float(args.energy_weight))
             setattr(criterion, 'energy_stride', int(args.energy_stride))
 
-        core = model.module if hasattr(model, "module") else model
-        criterion.nll_head_ref = core.head
-            
         model.train()
         rollout_k_curr, cons_w_d, sg_w_d = compute_curriculum_knobs(epoch, args, device)
 
@@ -4384,45 +4406,32 @@ def train(args):
                 # #----end-time----
 
                 core = unwrap(model)
-                mu_pred     = getattr(core.head, "last_mu", None)
-                logsig_pred = getattr(core.head, "last_logsig", None)   # <-- correct source
-                amp_pred    = getattr(core.head, "last_amp", None)
-                y_gate      = None
+                amp_pred = getattr(core.head, "last_amp", None)
 
+                # (optional) if your code still keeps a legacy per-channel sigma head:
+#                logsig_pred = getattr(core.head, "last_y_sigma", None)
+                logsig_pred = getattr(core.head, "last_logsig", None)   # <-- correct source                #mu_pred, logsig_pred, y_gate = None, None, getattr(core.head, "last_y_sigma", None)
+                y_gate = None
                 
-                # if hasattr(model, "param_nll"):
-                #     # θ from channels 19..21
-                #     #p0 = int(getattr(args, "y_channel", 18)) + 1
-                #     Y_final = dy_scalar.to(device).float().view(-1)       # [B]
+                if hasattr(model, "param_nll"):
+                    # θ from channels 19..21
+                    #p0 = int(getattr(args, "y_channel", 18)) + 1
+                    Y_final = dy_scalar.to(device).float().view(-1)       # [B]
 
-                #     # θ -> (μ_unit, σ_unit [, κ]) -> compose to Y
-                #     mu_unit, sigma_unit, kappa = model.param_nll(theta)                    # [B,C], [B,C], [B,C?]
-                #     muY, sigY = model.param_nll.compose_to_Y(mu_unit, sigma_unit, kappa, Y_final)  # [B,C]
+                    # θ -> (μ_unit, σ_unit [, κ]) -> compose to Y
+                    mu_unit, sigma_unit, kappa = model.param_nll(theta)                    # [B,C], [B,C], [B,C?]
+                    muY, sigY = model.param_nll.compose_to_Y(mu_unit, sigma_unit, kappa, Y_final)  # [B,C]
 
-                #     # Broadcast to spatial grid expected by the loss
-                #     B, C, H, W = y.shape[0], muY.shape[1], y.shape[-2], y.shape[-1]
-                #     mu_pred      = muY.view(B, C, 1, 1).expand(B, C, H, W)
-                #     logsig_pred  = softplus_inverse(sigY.view(B, C, 1, 1).expand(B, C, H, W))
-                # else:
-                #     # fall back to whatever the model head produced
-                #     mu_pred     = getattr(core.head, "last_mu", None)
-                #     logsig_pred = getattr(core.head, "last_logsig", None)                    # 1) Get θ=(m, Λ_QCD, μ0) and Y_final for this batch
-
+                    # Broadcast to spatial grid expected by the loss
+                    B, C, H, W = y.shape[0], muY.shape[1], y.shape[-2], y.shape[-1]
+                    mu_pred      = muY.view(B, C, 1, 1).expand(B, C, H, W)
+                else:
+                    # fall back to whatever the model head produced
+                    mu_pred     = getattr(core.head, "last_mu", None)
+             
                 
                 if mu_pred is None or logsig_pred is None:
                     print("[warn] last_mu/logsig missing; NLL will be inactive.")
-
-                if getattr(core.head, "last_logsig", None) is None:
-                    # Use the same tensors you just used for the training step:
-                    # base18, Y_scalar, theta must be in scope (see note below)
-                    _ = model(base18, Y_scalar, theta, sample=False)
-
-                sigma_raw = torch.nn.functional.softplus(core.head.last_logsig)  # [B,C,H,W]
-                sigma_train_mean = float(sigma_raw.mean().item())
-                sigma_min = float(sigma_raw.min().item())
-                sigma_max = float(sigma_raw.max().item())
-
-                print(f"TRAIN: sigma raw mean={sigma_train_mean:.4f} min={sigma_min:.4f} max={sigma_max:.4f}")
 
 
 #                #----time----
@@ -4475,8 +4484,8 @@ def train(args):
 
                     # ---- SINGLE consistency: match one-step transitions from that state ----
                     if w_single > 0.0:
-                        next_from_roll = model(yhat_roll.detach().clone(),       Y_scalar, theta)
-                        next_from_big  = model(yhat_single_big.detach().clone(), Y_scalar, theta)
+                        next_from_roll = model(yhat_roll.detach().clone(),       Y_scalar, theta, sample=False, dY=Y_scalar)
+                        next_from_big  = model(yhat_single_big.detach().clone(), Y_scalar, theta, sample=False, dY=Y_scalar)
                         Nr = dipole_from_links18(next_from_roll, offsets=sg_offsets)
                         Nb = dipole_from_links18(next_from_big,  offsets=sg_offsets)
                         rollout_single_loss = F.mse_loss(Nr, Nb)
@@ -4534,9 +4543,9 @@ def train(args):
                     # (Keep your existing code that creates Y_a, Y_b and runs the model twice.)
                     #
                     # Example skeleton (match to your variable names):
-                    u_a       = model(base18, Y_a, theta)
-                    u_comp    = model(u_a,   Y_b, theta)          # two-step (compose)
-                    u_direct  = model(base18, Y_a + Y_b, theta)   # one-step (direct)
+                    u_a       = model(base18, Y_a, theta, sample=False)
+                    u_comp    = model(u_a,   Y_b, theta, sample=False)          # two-step (compose)
+                    u_direct  = model(base18, Y_a + Y_b, theta, sample=False)   # one-step (direct)
 
                     # Compute dipole summaries (B, K) for both branches
                     # Optionally, pass a fixed 'offsets' from args for reproducibility.
@@ -4584,8 +4593,8 @@ def train(args):
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
-                    
-            #any_grad = False
+
+            # any_grad = False
             # for n,p in model.named_parameters():
             #     if "head.proj_logs" in n:
             #         g = None if p.grad is None else p.grad.data.norm().item()
@@ -4790,8 +4799,6 @@ def train(args):
 #        if torch.cuda.is_available(): torch.cuda.synchronize();
 #        t0=time.perf_counter()
 #        #----end-time----
-
-
         # ----------------- VALIDATION -----------------
         # Accumulators for Y-evolution diagnostics
         val_qslope_list = []
@@ -4808,8 +4815,8 @@ def train(args):
 
         model.eval()
         first_nonzeroY_probed = False
-#        sigma_eval  = torch.nn.functional.softplus(model.head.proj_logs(h)).mean().item()
-        
+
+
         if (not is_ddp) or dist.get_rank() == 0:
             dev = device  # same device as tensors below
             qs_stats_t = {
@@ -4856,38 +4863,29 @@ def train(args):
                     base18 = base18.contiguous(memory_format=torch.channels_last)
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
 #                    yh = model.forward(base18, Y_scalar, theta)
-                    yh = model(base18, Y_scalar, theta)
+                    yh = model(base18, Y_scalar, theta, sample=False)
                     dy_scalar = Y_scalar  # [B]
 
                     mu_pred, logsig_pred = None, None
-                    # if hasattr(model, "param_nll"):
-                    #     #p0 = int(getattr(args, "y_channel", 18)) + 1
-                    #     Y_final = dy_scalar.to(device).float().view(-1)
-                    #     mu_unit, sigma_unit, kappa = model.param_nll(theta)
-                    #     muY, sigY = model.param_nll.compose_to_Y(mu_unit, sigma_unit, kappa, Y_final)
-                    #     B, C, H, W = y.shape[0], muY.shape[1], y.shape[-2], y.shape[-1]
-                    #     mu_pred     = muY.view(B, C, 1, 1).expand(B, C, H, W)
-                    #     logsig_pred = softplus_inverse(sigY.view(B, C, 1, 1).expand(B, C, H, W))
-                    # else:
-                    core = unwrap(model)
-                    mu_pred     = getattr(core.head, "last_mu", None)
+                    if hasattr(model, "param_nll"):
+                        #p0 = int(getattr(args, "y_channel", 18)) + 1
+                        Y_final = dy_scalar.to(device).float().view(-1)
+                        mu_unit, sigma_unit, kappa = model.param_nll(theta)
+                        muY, sigY = model.param_nll.compose_to_Y(mu_unit, sigma_unit, kappa, Y_final)
+                        B, C, H, W = y.shape[0], muY.shape[1], y.shape[-2], y.shape[-1]
+                        mu_pred     = muY.view(B, C, 1, 1).expand(B, C, H, W)
+                    else:
+                        core = unwrap(model)
+                        mu_pred     = getattr(core.head, "last_mu", None)
+
                     logsig_pred = getattr(core.head, "last_logsig", None)
 
-
                     # y_gate is optional; define safely for this scope
-                    core = unwrap(model)
-                    if getattr(core.head, "last_logsig", None) is None:
-                        # Use the same tensors you just used for the training step:
-                        # base18, Y_scalar, theta must be in scope (see note below)
-                        _ = model(base18, Y_scalar, theta, sample=False)
-                        
-                    sigma_raw = torch.nn.functional.softplus(core.head.last_logsig)  # [B,C,H,W]
-                    sigma_train_mean = float(sigma_raw.mean().item())
-                    sigma_min = float(sigma_raw.min().item())
-                    sigma_max = float(sigma_raw.max().item())
-                    
-                    print(f"EVAL: sigma raw mean={sigma_train_mean:.4f} min={sigma_min:.4f} max={sigma_max:.4f}")
-                    
+                    try:
+                        core = unwrap(model)
+                        y_gate = getattr(core.head, "last_y_sigma", None)
+                    except Exception:
+                        y_gate = None
                     
 
                     l, stats_val = criterion(
@@ -4899,7 +4897,7 @@ def train(args):
                         logsig_pred = logsig_pred,
                         drift_pred=mu_pred,         # drift per channel (what head calls μ)
                         amp_pred=amp_pred,          # physical amplitude s(x,y) ≥ 0
-                        y_gate = None,
+                        y_gate = y_gate,
                         return_stats = True
                     )
 

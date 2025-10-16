@@ -345,13 +345,13 @@ def _build_evolver_from_ckpt_args(in_ctor, ckpt_args: dict):
         "rbf_K": 12,
         "film_hidden": 64,
         "gamma_scale": 1.5,
-        "beta_scale": 1.5,
-        "gate_temp": 0.5,          # keep training default if absent
+        "beta_scale": 1.,
+        "gate_temp": 1.0,          # keep training default if absent
         "y_gain": 1.0,
         "identity_eps": 0.0,
         "alpha_scale": 3.0,
-        "clamp_alphas": 2.0,
-        "alpha_vec_cap": 9.0,
+        "clamp_alphas": None,
+        "alpha_vec_cap": 15.0,
         # propagate Y normalization boundaries
         "y_min": ckpt_args.get("y_min", 0.0),
         "y_max": ckpt_args.get("y_max", 1.0),
@@ -993,7 +993,7 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
     model.eval()
     with torch.no_grad():
         base18, Y_scalar, theta = split_legacy_x(x)
-        yhat = model(base18, Y_scalar, theta, sample=sample)  # [1,18,H,W]
+        yhat = model(base18, Y_scalar, theta, sample=sample, dY=Y_scalar)  # [1,18,H,W]
 
         # inside main(), AFTER you build base18, Y_scalar, theta
         core = model.module if hasattr(model, "module") else model
