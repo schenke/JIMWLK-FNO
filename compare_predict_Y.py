@@ -349,7 +349,7 @@ def _build_evolver_from_ckpt_args(in_ctor, ckpt_args: dict):
         "gate_temp": 1.0,          # keep training default if absent
         "y_gain": 1.0,
         "identity_eps": 0.0,
-        "alpha_scale": 3.0,
+        "alpha_scale": 1.0,
         "clamp_alphas": None,
         "alpha_vec_cap": 15.0,
         # propagate Y normalization boundaries
@@ -993,7 +993,7 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
     model.eval()
     with torch.no_grad():
         base18, Y_scalar, theta = split_legacy_x(x)
-        yhat = model(base18, Y_scalar, theta, sample=sample, dY=Y_scalar)  # [1,18,H,W]
+        yhat, extras = model(base18, Y_scalar, theta, sample=sample, dY=Y_scalar)  # [1,18,H,W]
 
         # inside main(), AFTER you build base18, Y_scalar, theta
         core = model.module if hasattr(model, "module") else model
@@ -1002,12 +1002,11 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
             h = model.encode_trunk_from_components(base18, Y_scalar, theta)
             logsig = core.head.proj_logs(h)
             sigma_raw   = F.softplus(logsig)
-            sigma_final = sigma_raw + core.head.sigma_floor
+            sigma_final = sigma_raw 
         print("infer σ_raw   mean/min/max:",
               float(sigma_raw.mean()), float(sigma_raw.min()), float(sigma_raw.max()))
         print("infer σ_final mean/min/max:",
               float(sigma_final.mean()), float(sigma_final.min()), float(sigma_final.max()))
-        print("sigma_floor in predictor:", float(core.head.sigma_floor))
         
         #     # quick movement check before any projection/repair
     #     try:
@@ -1122,7 +1121,7 @@ def forward_at_Y(x_one: torch.Tensor, Y: float) -> tuple[torch.Tensor, torch.Ten
     """
     x = x_one.clone()
     x[:, YCH:YCH+1, :, :] = Y
-    yhat = model(x)
+    yhat, extras = model(x)
     # --- REPLACE THIS with your script’s SU(3) reconstruction ---
     # Example possibilities:
     #   Uhat = criterion._pack18_to_U(yhat)
@@ -1405,8 +1404,8 @@ def main():
         capt.setdefault('a', []).append(output.detach().cpu().numpy())  # [B,8,H,W]
 
     h = model.head.proj_mu.register_forward_hook(_hook_proj_mu)
-    _ = predict_Uy(model, U0, 0.0,      params, device=device, sample=True)
-    _ = predict_Uy(model, U0, float(Y), params, device=device, sample=True)
+    _ = predict_Uy(model, U0, 0.0,      params, device=device, sample=False) #was false
+    _ = predict_Uy(model, U0, float(Y), params, device=device, sample=False) #was false
     h.remove()
 
     
