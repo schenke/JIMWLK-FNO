@@ -23,6 +23,7 @@ from torch.amp import GradScaler as _GradScaler
 from torch.cuda.amp import GradScaler as _CudaGradScaler
 from contextlib import nullcontext
 from torch.nn.parameter import UninitializedParameter
+import contextlib
 
 # Learn (U0, Y, params) -> U_Y from JIMWLK outputs + manifest.json
 # - Lattice size N inferred from data (no --size)
@@ -3417,108 +3418,219 @@ class GroupLossWithQs(GroupLoss):
                 )  # [B, C, Hs, Ws]
 
 
-            # 2) Choose predicted drift/amp sources (amp is σ per-unit-Y)
-            drift = drift_pred if (drift_pred is not None) else mu_pred
-            if amp_pred is not None:
-                amp = amp_pred                             # assume positive σ if provided
-            elif logsig_pred is not None:
-                amp = F.softplus(logsig_pred)              # σ ≥ 0 from log-std
+        # 2) Choose predicted drift/amp sources (amp ≡ σ per unit Y)
+        drift = drift_pred if (drift_pred is not None) else mu_pred
+        if amp_pred is not None:
+            sigma = amp_pred
+        elif logsig_pred is not None:
+            sigma = F.softplus(logsig_pred)
+        else:
+            sigma = None
+
+        if (drift is not None) and (sigma is not None):
+            # 3) Downsample to α grid
+            def to_alpha_grid(t, stride):
+                if stride <= 1: return t
+                if t.dim() != 4: raise ValueError("expect 4D [B,C,H,W] tensors")
+                return F.avg_pool2d(t, kernel_size=stride, stride=stride, ceil_mode=False)
+
+            drift_s = to_alpha_grid(drift, s)  # [B, Cd, Hs, Ws]
+
+            # >>> FIX #1: preserve variance correctly by pooling σ^2, not σ <<<
+            sigma2 = sigma.pow(2)
+            sigma2_s = to_alpha_grid(sigma2, s)            # [B, Ca, Hs, Ws]
+            # if sigma was broadcast-like, handle that path too:
+            if sigma2_s.shape[1] == 1 and drift_s.shape[1] != 1:
+                sigma2_s = sigma2_s.expand(drift_s.shape[0], drift_s.shape[1], *sigma2_s.shape[-2:])
+
+            # 4) Align batch & channels
+            B, C, Hs, Ws = a_true.shape
+            if drift_s.shape[0] != B: drift_s = drift_s[:B]
+            if sigma2_s.shape[0] != B: sigma2_s = sigma2_s[:B]
+            Cmin = min(C, drift_s.shape[1], sigma2_s.shape[1])
+            if Cmin != C:
+                a_true   = a_true[:,  :Cmin]
+                drift_s  = drift_s[:, :Cmin]
+                sigma2_s = sigma2_s[:, :Cmin]
+
+            # 5) Build dY and broadcast
+            if dy_scalar is None:
+                dY = torch.ones(B, 1, 1, 1, device=a_true.device, dtype=a_true.dtype)
             else:
-                amp = None
+                sdy = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:B]
+                dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
+                if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
 
-            if (drift is not None) and (amp is not None):
-                # 3) Downsample predictions to α grid via avg-pool (preserves variance)
-                def to_alpha_grid(t, stride):
-                    if stride <= 1:
-                        return t
-                    if t.dim() != 4:
-                        raise ValueError("expect 4D [B,C,H,W] tensors")
-                    return F.avg_pool2d(t, kernel_size=stride, stride=stride, ceil_mode=False)
+            eps = 1e-12
 
-                drift_s = to_alpha_grid(drift, s)  # [B, Cd, Hs, Ws]
-                if amp.dim() == 4:
-                    amp_s = to_alpha_grid(amp, s)  # [B, Ca, Hs, Ws]
-                else:
-                    amp = amp.view(amp.shape[0], 1, drift.shape[-2], drift.shape[-1]).expand_as(drift)
-                    amp_s = to_alpha_grid(amp, s)
+            # Optional cap (looser to avoid bias-low); or remove and parameterize σ in the head instead
+            sigma2_min = float(getattr(self, "moment_sigma2_min", 1e-8))
+            sigma2_max = float(getattr(self, "moment_sigma2_max", 0.50**2))  # allow more headroom
+            sigma2_s = sigma2_s.clamp(min=sigma2_min, max=sigma2_max)
 
-                # 4) Align batch & channels
-                B, C, Hs, Ws = a_true.shape
-                if drift_s.shape[0] != B: drift_s = drift_s[:B]
-                if amp_s.shape[0]   != B: amp_s   = amp_s[:B]
+            # Step moments
+            mu_step_s = drift_s * dY                         # [B,C,Hs,Ws]
+            vpred     = sigma2_s * dY                        # [B,C,Hs,Ws]
+            resid     = a_true - mu_step_s
 
-                if amp_s.shape[1] == 1 and drift_s.shape[1] != 1:
-                    amp_s = amp_s.expand(B, drift_s.shape[1], Hs, Ws)
-                Cmin = min(C, drift_s.shape[1], amp_s.shape[1])
-                if Cmin != C:
-                    a_true  = a_true[:,  :Cmin]
-                    drift_s = drift_s[:, :Cmin]
-                    amp_s   = amp_s[:,  :Cmin]
+            # >>> FIX #2: let a small fraction of grad hit σ to push it UP when needed <<<
+            rho = float(getattr(self, "moment_whiten_grad_mix", 0.))  # 0 (old detach) .. 1 (full grad)
+            v_whiten = (1.0 - rho) * vpred.detach() + rho * vpred
 
-                # 5) Build dY and broadcast
-                if dy_scalar is None:
-                    dY = torch.ones(B, 1, 1, 1, device=a_true.device, dtype=a_true.dtype)
-                else:
-                    sdy = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:B]
-                    dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
-                    if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
+            # 7) NLL-consistent pieces
+            # m1: whitened residual (encourages correct mean); partial grad to σ via rho
+            m1 = (resid.pow(2) / (v_whiten + eps)).mean()
 
-                # === Stabilizers (key changes) ===========================================
-                eps = 1e-12
+            # m2: two-sided moment guard with deadzone, but underestimation gets a smaller weight
+            m2_pred = (mu_step_s.detach().pow(2) + vpred)    # detach μ to not bias mean via m2
+            m2_true = a_true.pow(2)
 
-                # (A) Bound σ inside the loss to avoid blow-ups (doesn't change your model)
-                sigma_min = float(getattr(self, "moment_sigma_min", 1e-4))
-                sigma_max = float(getattr(self, "moment_sigma_max", 0.20))
-                amp_s = amp_s.clamp(min=sigma_min, max=sigma_max)  # σ in [σ_min, σ_max]
+            tau_over  = float(getattr(self, "moment_over_tau", 0.10))
+            tau_under = float(getattr(self, "moment_under_tau", 0.05))
 
-                # (B) Residual and predicted variance for THIS step
-                mu_step_s = drift_s * dY
-                resid     = a_true - mu_step_s                    # [B,C,Hs,Ws]
-                vpred     = (amp_s ** 2) * dY                     # [B,C,Hs,Ws]
+            m2_over  = F.relu(m2_pred - (1.0 + tau_over)  * m2_true)
+            m2_under = F.relu((1.0 - tau_under) * m2_true - m2_pred)
 
-                # (C) Mean term: whitened residual but STOP grad through vpred
-                #     Prevents σ from trivially shrinking this term.
-                m1 = (resid.pow(2) / (vpred.detach() + eps)).mean()
+            w_over   = float(getattr(self, "moment_m2_over_weight", 0.25))  # stronger
+            w_under  = float(getattr(self, "moment_m2_under_weight", 0.10)) # gentler
+            m2 = (w_over * m2_over + w_under * m2_under).mean()
 
-                # (D) One-sided moment guard: only punish OVER-estimation of second moment
-                #     E[a^2] = (mu_step)^2 + vpred ; use observed a_true^2 as target
-                m2_pred = mu_step_s.detach().pow(2) + vpred       # detach mean to not bias μ
-                m2_true = a_true.pow(2)
-                tau = float(getattr(self, "moment_over_tau", 0.10))  # 10% slack by default
-                m2 = F.relu(m2_pred - (1.0 + tau) * m2_true).mean()
+            # (Optional) smoothness on log σ to avoid speckle
+            h1_w = float(getattr(self, "moment_amp_h1", 0.0))
+            if h1_w > 0.0:
+                log_sigma_s = 0.5 * torch.log(sigma2_s + eps)               # log σ
+                dx = log_sigma_s[..., :, 1:] - log_sigma_s[..., :, :-1]
+                dy = log_sigma_s[..., 1:, :] - log_sigma_s[..., :-1, :]
+                m3 = (dx.pow(2).mean() + dy.pow(2).mean())
+            else:
+                m3 = torch.zeros((), device=a_true.device, dtype=a_true.dtype)
 
-                # (E) Optional: mild spatial smoothness on log σ (robust)
-                h1_w = float(getattr(self, "moment_amp_h1", 0.0))
-                if h1_w > 0.0:
-                    log_sigma_unit = torch.log(amp_s + eps)
-                    dx = log_sigma_unit[..., :, 1:] - log_sigma_unit[..., :, :-1]
-                    dy = log_sigma_unit[..., 1:, :] - log_sigma_unit[..., :-1, :]
-                    m3 = (dx.pow(2).mean() + dy.pow(2).mean())
-                else:
-                    m3 = torch.zeros((), device=a_true.device, dtype=a_true.dtype)
+            # (Optional) weak prior nudging σ toward init (raise if you still see bias-low)
+            sigma0 = float(getattr(self, "moment_sigma0", 0.03))
+            lambda_sigma = float(getattr(self, "moment_sigma_prior", 0.0))  # e.g., 1e-3
+            m4 = lambda_sigma * (0.5*torch.log(sigma2_s + eps) - math.log(sigma0)).pow(2).mean()
 
-                # (F) Optional: tiny prior to keep σ near init (gentle)
-                sigma0 = float(getattr(self, "moment_sigma0", 0.03))
-                lambda_sigma = float(getattr(self, "moment_sigma_prior", 0.0))  # e.g. 1e-3
-                m4 = lambda_sigma * (torch.log(amp_s + eps) - math.log(sigma0)).pow(2).mean()
+            # 9) Weights
+            m1_w = float(getattr(self, "moment_m1_weight", 1.0))
+            m3_w = h1_w
 
-                # 9) Weights (keep your defaults, adjust if desired)
-                m1_w = float(getattr(self, "moment_m1_weight", 1.0))   # mean term
-                m2_w = float(getattr(self, "moment_m2_weight", 0.25))  # over-variance guard
-                m3_w = h1_w                                            # use same flag as weight
+            moment_loss = m1_w * m1 + m2 + m3_w * m3 + m4
+            total = total + float(self.moment_weight) * moment_loss
 
-                moment_loss = m1_w * m1 + m2_w * m2 + m3_w * m3 + m4
-                total = total + float(self.moment_weight) * moment_loss
+            # Stats
+            stats["moment/m1"] = m1.detach()
+            stats["moment/m2_over"] = m2_over.mean().detach()
+            stats["moment/m2_under"] = m2_under.mean().detach()
+            if h1_w > 0.0: stats["moment/m3_tv"] = m3.detach()
+            if lambda_sigma > 0.0: stats["moment/m4_sigma_prior"] = m4.detach()
+            stats["moment/vpred_mean"] = vpred.mean().detach()
+            stats["moment/m2_pred_mean"] = m2_pred.mean().detach()
+            stats["moment/m2_true_mean"] = m2_true.mean().detach()
+            stats["moment/calib_ratio"] = (m2_pred.mean() / (m2_true.mean() + eps)).detach()
 
-                # 10) Stats
-                stats["moment/m1"] = m1.detach()
-                stats["moment/m2_over"] = m2.detach()
-                if h1_w > 0.0: stats["moment/m3_tv"] = m3.detach()
-                if lambda_sigma > 0.0: stats["moment/m4_sigma_prior"] = m4.detach()
-                stats["moment/vpred_mean"] = vpred.mean().detach()
-                stats["moment/m2_pred_mean"] = m2_pred.mean().detach()
-                stats["moment/m2_true_mean"] = m2_true.mean().detach()
-                stats["moment/calib_ratio"] = (m2_pred.mean() / (m2_true.mean() + eps)).detach()
+                
+            # # 2) Choose predicted drift/amp sources (amp is σ per-unit-Y)
+            # drift = drift_pred if (drift_pred is not None) else mu_pred
+            # if amp_pred is not None:
+            #     amp = amp_pred                             # assume positive σ if provided
+            # elif logsig_pred is not None:
+            #     amp = F.softplus(logsig_pred)              # σ ≥ 0 from log-std
+            # else:
+            #     amp = None
+
+            # if (drift is not None) and (amp is not None):
+            #     # 3) Downsample predictions to α grid via avg-pool (preserves variance)
+            #     def to_alpha_grid(t, stride):
+            #         if stride <= 1:
+            #             return t
+            #         if t.dim() != 4:
+            #             raise ValueError("expect 4D [B,C,H,W] tensors")
+            #         return F.avg_pool2d(t, kernel_size=stride, stride=stride, ceil_mode=False)
+
+            #     drift_s = to_alpha_grid(drift, s)  # [B, Cd, Hs, Ws]
+            #     if amp.dim() == 4:
+            #         amp_s = to_alpha_grid(amp, s)  # [B, Ca, Hs, Ws]
+            #     else:
+            #         amp = amp.view(amp.shape[0], 1, drift.shape[-2], drift.shape[-1]).expand_as(drift)
+            #         amp_s = to_alpha_grid(amp, s)
+
+            #     # 4) Align batch & channels
+            #     B, C, Hs, Ws = a_true.shape
+            #     if drift_s.shape[0] != B: drift_s = drift_s[:B]
+            #     if amp_s.shape[0]   != B: amp_s   = amp_s[:B]
+
+            #     if amp_s.shape[1] == 1 and drift_s.shape[1] != 1:
+            #         amp_s = amp_s.expand(B, drift_s.shape[1], Hs, Ws)
+            #     Cmin = min(C, drift_s.shape[1], amp_s.shape[1])
+            #     if Cmin != C:
+            #         a_true  = a_true[:,  :Cmin]
+            #         drift_s = drift_s[:, :Cmin]
+            #         amp_s   = amp_s[:,  :Cmin]
+
+            #     # 5) Build dY and broadcast
+            #     if dy_scalar is None:
+            #         dY = torch.ones(B, 1, 1, 1, device=a_true.device, dtype=a_true.dtype)
+            #     else:
+            #         sdy = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:B]
+            #         dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
+            #         if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
+
+            #     # === Stabilizers (key changes) ===========================================
+            #     eps = 1e-12
+
+            #     # (A) Bound σ inside the loss to avoid blow-ups (doesn't change your model)
+            #     sigma_min = float(getattr(self, "moment_sigma_min", 1e-4))
+            #     sigma_max = float(getattr(self, "moment_sigma_max", 0.20))
+            #     amp_s = amp_s.clamp(min=sigma_min, max=sigma_max)  # σ in [σ_min, σ_max]
+
+            #     # (B) Residual and predicted variance for THIS step
+            #     mu_step_s = drift_s * dY
+            #     resid     = a_true - mu_step_s                    # [B,C,Hs,Ws]
+            #     vpred     = (amp_s ** 2) * dY                     # [B,C,Hs,Ws]
+
+            #     # (C) Mean term: whitened residual but STOP grad through vpred
+            #     #     Prevents σ from trivially shrinking this term.
+            #     m1 = (resid.pow(2) / (vpred.detach() + eps)).mean()
+
+            #     # (D) One-sided moment guard: only punish OVER-estimation of second moment
+            #     #     E[a^2] = (mu_step)^2 + vpred ; use observed a_true^2 as target
+            #     m2_pred = mu_step_s.detach().pow(2) + vpred       # detach mean to not bias μ
+            #     m2_true = a_true.pow(2)
+            #     tau = float(getattr(self, "moment_over_tau", 0.10))  # 10% slack by default
+            #     m2 = F.relu(m2_pred - (1.0 + tau) * m2_true).mean()
+
+            #     # (E) Optional: mild spatial smoothness on log σ (robust)
+            #     h1_w = float(getattr(self, "moment_amp_h1", 0.0))
+            #     if h1_w > 0.0:
+            #         log_sigma_unit = torch.log(amp_s + eps)
+            #         dx = log_sigma_unit[..., :, 1:] - log_sigma_unit[..., :, :-1]
+            #         dy = log_sigma_unit[..., 1:, :] - log_sigma_unit[..., :-1, :]
+            #         m3 = (dx.pow(2).mean() + dy.pow(2).mean())
+            #     else:
+            #         m3 = torch.zeros((), device=a_true.device, dtype=a_true.dtype)
+
+            #     # (F) Optional: tiny prior to keep σ near init (gentle)
+            #     sigma0 = float(getattr(self, "moment_sigma0", 0.03))
+            #     lambda_sigma = float(getattr(self, "moment_sigma_prior", 0.0))  # e.g. 1e-3
+            #     m4 = lambda_sigma * (torch.log(amp_s + eps) - math.log(sigma0)).pow(2).mean()
+
+            #     # 9) Weights (keep your defaults, adjust if desired)
+            #     m1_w = float(getattr(self, "moment_m1_weight", 1.0))   # mean term
+            #     m2_w = float(getattr(self, "moment_m2_weight", 0.25))  # over-variance guard
+            #     m3_w = h1_w                                            # use same flag as weight
+
+            #     moment_loss = m1_w * m1 + m2_w * m2 + m3_w * m3 + m4
+            #     total = total + float(self.moment_weight) * moment_loss
+
+            #     # 10) Stats
+            #     stats["moment/m1"] = m1.detach()
+            #     stats["moment/m2_over"] = m2.detach()
+            #     if h1_w > 0.0: stats["moment/m3_tv"] = m3.detach()
+            #     if lambda_sigma > 0.0: stats["moment/m4_sigma_prior"] = m4.detach()
+            #     stats["moment/vpred_mean"] = vpred.mean().detach()
+            #     stats["moment/m2_pred_mean"] = m2_pred.mean().detach()
+            #     stats["moment/m2_true_mean"] = m2_true.mean().detach()
+            #     stats["moment/calib_ratio"] = (m2_pred.mean() / (m2_true.mean() + eps)).detach()
 
 
             #     # 2) Choose predicted drift/amp sources
@@ -4199,20 +4311,42 @@ def _build_x_from_parts(base18: 'torch.Tensor', y_scalar: 'torch.Tensor', params
     return xnew
 
 
+def rollout_predict(model, base18, dYin, k, theta,
+                    *, track_grad=True):
+    """
+    Returns:
+      yhat_roll:      k small steps from (random) start
+      yhat_single_big: one big step of size k*ΔY from same (random) start
+    """
 
-def rollout_predict(model, base18, Y_scalar, k, theta,
-                    device_type="cuda", amp_dtype=torch.bfloat16, use_amp=True):
-    # 1 big step: keep grads (we often compute loss on this)
-    with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-        y_single, extras = model(base18, Y_scalar * k, theta, sample=False, dY=Y_scalar * k)
+    # --- main rollout used in losses (GRADS ON) ---
+    ctx = contextlib.nullcontext() if track_grad else torch.no_grad()
+    with ctx:
+        # one big step of size k*ΔY from U_start
+        yhat_single_big, _ = model(base18, dYin * k, theta, sample=False, dY=dYin * k)
 
-    # k small steps: no grads, no version counters (saves a lot of memory)
-    with torch.inference_mode(), torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-        base_curr = base18
+        # k small steps from U_start
+        y = base18
         for _ in range(k):
-            base_curr, extras = model(base_curr, Y_scalar, theta, sample=False, dY=Y_scalar)
-    y_roll = base_curr  # already detached
-    return y_roll, y_single
+            y, _ = model(y, dYin, theta, sample=False, dY=dYin)
+        yhat_roll = y
+
+    return yhat_roll, yhat_single_big
+
+
+# def rollout_predict(model, base18, Y_scalar, k, theta,
+#                     device_type="cuda", amp_dtype=torch.bfloat16, use_amp=True):
+#     # 1 big step: keep grads (we often compute loss on this)
+#     with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+#         y_single, extras = model(base18, Y_scalar * k, theta, sample=False, dY=Y_scalar * k)
+
+#     # k small steps: no grads, no version counters (saves a lot of memory)
+#     with torch.inference_mode(), torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+#         base_curr = base18
+#         for _ in range(k):
+#             base_curr, extras = model(base_curr, Y_scalar, theta, sample=False, dY=Y_scalar)
+#     y_roll = base_curr  # already detached
+#     return y_roll, y_single
 
 
 # def rollout_predict(model, base18, Y_scalar, k, theta,
@@ -4933,73 +5067,96 @@ def train(args):
 #                #----end-time----
 
 
-                # ----- Rollout consistency (state) + rollout SINGLE consistency (transition) -----
                 rollout_k = int(rollout_k_curr)
-                w_state   = float(getattr(args, "rollout_consistency", 0.0))            # state match
-                w_single  = float(getattr(args, "rollout_single_consistency", 0.0))     # transition match
+                w_state   = float(getattr(args, "rollout_consistency", 0.0))
+                w_single  = float(getattr(args, "rollout_single_consistency", 0.0))
 
-                # Disable heavy stuff on CPU if requested
+
+                B = base18.size(0)
+                
+                def as_B1111(val, ref):
+                    t = torch.as_tensor(val, device=ref.device, dtype=ref.dtype)
+                    return t.view(1,1,1,1).expand(B,1,1,1)  # broadcast per-sample
+
+                # one-step ΔY (float or tensor) -> batch tensor
+                dY_step_val = steps_to_Y(1, ds_value.item() if torch.is_tensor(ds_value) else ds_value)
+                Y_scalar = as_B1111(dY_step_val, base18)   # [B,1,1,1]
+#                dY = steps_to_Y(1, ds_value)
+                
                 if (base18.device.type == "cpu") and bool(getattr(args, "skip_heavy_on_cpu", True)):
                     w_state = 0.0
                     w_single = 0.0
 
                 if rollout_k > 1 and (w_state > 0.0 or w_single > 0.0):
-                    # k small steps vs one big step to reach the same rapidity k*ΔY
-                    yhat_roll, yhat_single_big = rollout_predict(model, base18, Y_scalar, rollout_k, theta)
+                    #start from final U (called y) and evolve k steps
+                    yhat_roll, yhat_single_big = rollout_predict(
+                        model, y, Y_scalar, rollout_k, theta,
+                        track_grad=True
+                    )
 
                     sg_offsets = getattr(args, "sg_dipole_offsets", None)
 
-                    # ---- STATE consistency: match states at k*ΔY ----
                     if w_state > 0.0:
                         Nd = dipole_from_links18(yhat_single_big, offsets=sg_offsets)
                         Nc = dipole_from_links18(yhat_roll,       offsets=sg_offsets)
                         rollout_state_loss = F.mse_loss(Nd, Nc)
                         loss = loss + w_state * rollout_state_loss
                         meters.add("train/rollout_state_cons", rollout_state_loss.detach(), base18.size(0))
-
-                    # ---- SINGLE consistency: match one-step transitions from that state ----
+ 
                     if w_single > 0.0:
-                        next_from_roll, extras = model(yhat_roll.detach().clone(),       Y_scalar, theta, sample=False, dY=Y_scalar)
-                        next_from_big, extras  = model(yhat_single_big.detach().clone(), Y_scalar, theta, sample=False, dY=Y_scalar)
+                        # transitions from each predicted state (grads OK)
+                        next_from_roll,  _ = model(yhat_roll.detach().clone(),       Y_scalar, theta, sample=False, dY=Y_scalar)
+                        next_from_big,   _ = model(yhat_single_big.detach().clone(), Y_scalar, theta, sample=False, dY=Y_scalar)
                         Nr = dipole_from_links18(next_from_roll, offsets=sg_offsets)
                         Nb = dipole_from_links18(next_from_big,  offsets=sg_offsets)
                         rollout_single_loss = F.mse_loss(Nr, Nb)
                         loss = loss + w_single * rollout_single_loss
                         meters.add("train/rollout_single_cons", rollout_single_loss.detach(), base18.size(0))
-
-                    del yhat_roll, yhat_single_big
                 else:
                     meters.add("train/rollout_state_cons",  torch.zeros((), device=base18.device), base18.size(0))
                     meters.add("train/rollout_single_cons", torch.zeros((), device=base18.device), base18.size(0))
 
 
 
-#                 rollout_k = int(rollout_k_curr)
-#                 rollout_cons_w = float(cons_w)
-#                 if (base18.device.type == 'cpu') and bool(getattr(args,'skip_heavy_on_cpu', True)):
-#                     rollout_cons_w = 0.0
+                # # ----- Rollout consistency (state) + rollout SINGLE consistency (transition) -----
+                # rollout_k = int(rollout_k_curr)
+                # w_state   = float(getattr(args, "rollout_consistency", 0.0))            # state match
+                # w_single  = float(getattr(args, "rollout_single_consistency", 0.0))     # transition match
 
-#                 # rollout consistency regularizer (only if both enabled)
-#                 if (rollout_k > 1) and (rollout_cons_w > 0.0):
-#                     yhat_roll, yhat_single_big = rollout_predict(model, base18, Y_scalar, rollout_k, theta)
-#                     sg_offsets = getattr(args, "sg_dipole_offsets", None)
-#                     Nd = dipole_from_links18(yhat_single_big, offsets=sg_offsets)  # (B,K)
-#                     Nc = dipole_from_links18(yhat_roll,       offsets=sg_offsets)  # (B,K)
-#                     rollout_loss = F.mse_loss(Nd, Nc)
-# #                    cons = ((yhat_roll - yhat_single) ** 2).mean()
-#                     loss = loss + rollout_cons_w * rollout_loss
-#                     meters.add("train/rollout_cons", rollout_loss.detach(), base18.size(0))
-#                     del yhat_roll, yhat_single_big, rollout_loss
-#                 else:
-#                     # keep the metric stream consistent; log zero when disabled
-#                     meters.add("train/rollout_cons",
-#                                torch.zeros((), device=base18.device), base18.size(0))
+                # # Disable heavy stuff on CPU if requested
+                # if (base18.device.type == "cpu") and bool(getattr(args, "skip_heavy_on_cpu", True)):
+                #     w_state = 0.0
+                #     w_single = 0.0
 
-#                 # rollout-single consistency
-#                 if int(getattr(args, "rollout_k", 1)) > 1 and float(getattr(args, "rollout_consistency", 0.0)) > 0.0 and (yhat_single is not None):
-#                     cons = torch.mean((yhat_single - yhat) ** 2)
-#                     loss = loss + float(args.rollout_consistency) * cons
-#                     meters.add("train/rollout_cons", cons.detach(), base18.size(0))
+                # if rollout_k > 1 and (w_state > 0.0 or w_single > 0.0):
+                #     # k small steps vs one big step to reach the same rapidity k*ΔY
+                #     yhat_roll, yhat_single_big = rollout_predict(model, base18, Y_scalar, rollout_k, theta)
+
+                #     sg_offsets = getattr(args, "sg_dipole_offsets", None)
+
+                #     # ---- STATE consistency: match states at k*ΔY ----
+                #     if w_state > 0.0:
+                #         Nd = dipole_from_links18(yhat_single_big, offsets=sg_offsets)
+                #         Nc = dipole_from_links18(yhat_roll,       offsets=sg_offsets)
+                #         rollout_state_loss = F.mse_loss(Nd, Nc)
+                #         loss = loss + w_state * rollout_state_loss
+                #         meters.add("train/rollout_state_cons", rollout_state_loss.detach(), base18.size(0))
+
+                #     # ---- SINGLE consistency: match one-step transitions from that state ----
+                #     if w_single > 0.0:
+                #         next_from_roll, extras = model(yhat_roll.detach().clone(),       Y_scalar, theta, sample=False, dY=Y_scalar)
+                #         next_from_big, extras  = model(yhat_single_big.detach().clone(), Y_scalar, theta, sample=False, dY=Y_scalar)
+                #         Nr = dipole_from_links18(next_from_roll, offsets=sg_offsets)
+                #         Nb = dipole_from_links18(next_from_big,  offsets=sg_offsets)
+                #         rollout_single_loss = F.mse_loss(Nr, Nb)
+                #         loss = loss + w_single * rollout_single_loss
+                #         meters.add("train/rollout_single_cons", rollout_single_loss.detach(), base18.size(0))
+
+                #     del yhat_roll, yhat_single_big
+                # else:
+                #     meters.add("train/rollout_state_cons",  torch.zeros((), device=base18.device), base18.size(0))
+                #     meters.add("train/rollout_single_cons", torch.zeros((), device=base18.device), base18.size(0))
+
 
                 # --- semigroup ---
                 # --- semigroup on dipoles instead of Wilson lines ---
