@@ -36,6 +36,32 @@ _RADIAL_CACHE = {}  # key: (H, W, device) -> (bins[H,W] long, counts[L] long)
 
 import torch, torch.distributed as dist
 
+# --- Canonical SU(3) Gell-Mann matrices (optionally divided by 2) ---
+def su3_gellmann_matrices(
+    *, dtype: torch.dtype = torch.complex64,
+    device: torch.device | None = None,
+    half: bool = True,
+) -> torch.Tensor:
+    """Return λ_a (a=1..8) as a tensor of shape [8,3,3].
+    If `half` is True (default), returns λ_a/2.
+    """
+    L = torch.zeros(8, 3, 3, dtype=torch.complex64, device=device)
+    # λ1..λ8 (physics convention)
+    L[0,0,1] = L[0,1,0] = 1
+    L[1,0,1] = -1j; L[1,1,0] =  1j
+    L[2,0,0] = 1;   L[2,1,1] = -1
+    L[3,0,2] = L[3,2,0] = 1
+    L[4,0,2] = -1j; L[4,2,0] =  1j
+    L[5,1,2] = L[5,2,1] = 1
+    L[6,1,2] = -1j; L[6,2,1] =  1j
+    s3 = 1.0 / (3.0 ** 0.5)
+    L[7,0,0] = s3; L[7,1,1] = s3; L[7,2,2] = -2 * s3
+    if half:
+        L = L / 2.0
+    # cast/move if needed; buffers will follow the module when .to(device) is called
+    return L.to(dtype=dtype, device=device) if (dtype != torch.complex64 or device is not None) else L
+
+
 def is_main():
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
@@ -143,6 +169,58 @@ def snapshot_params(module, buf_list=None, dtype=torch.float32):
     for buf, p in zip(buf_list, params):
         buf.copy_(p.to(dtype))
     return buf_list
+
+def _iso_radial_power(x: torch.Tensor, nbins: int | None = None,
+                      exclude_dc: bool = True, window: bool = False) -> torch.Tensor:
+    """
+    x: [B, C, H, W] real tensor
+    returns: [B, C, K] isotropic (radial) power spectrum with K bins
+    """
+    B, C, H, W = x.shape
+
+    # Optional Hann window to reduce leakage if boundaries aren't periodic
+    if window:
+        wy = torch.hann_window(H, dtype=x.dtype, device=x.device).view(1, 1, H, 1)
+        wx = torch.hann_window(W, dtype=x.dtype, device=x.device).view(1, 1, 1, W)
+        x = x * wy * wx
+
+    X = torch.fft.fftn(x, dim=(-2, -1), norm='ortho')         # complex
+    P = (X.real**2 + X.imag**2)                               # [B,C,H,W]
+
+    # Radial frequency grid
+    fy = torch.fft.fftfreq(H, device=x.device).view(H, 1).expand(H, W)
+    fx = torch.fft.fftfreq(W, device=x.device).view(1, W).expand(H, W)
+    r  = torch.sqrt(fy*fy + fx*fx)                            # [H,W]
+
+    if nbins is None:
+        nbins = int(min(H, W) // 2)
+
+    edges = torch.linspace(0, r.max() + 1e-7, nbins + 1, device=x.device)
+    ridx  = torch.bucketize(r.reshape(-1), edges) - 1         # [H*W], in [0..nbins-1]
+    ridx  = ridx.clamp_(0, nbins - 1)
+
+    # Valid mask: exclude the whole DC bin if requested
+    valid = torch.ones_like(ridx, dtype=torch.bool)
+    if exclude_dc:
+        valid = ridx >= 1
+
+    # Prepare 2D scatter inputs
+    Pflat        = P.reshape(B * C, -1)                       # [B*C, H*W]
+    ridx_expand  = ridx.unsqueeze(0).expand(B * C, -1)        # [B*C, H*W]
+    valid_expand = valid.unsqueeze(0).expand(B * C, -1)       # [B*C, H*W]
+
+    # Zero-out invalid contributions (keep shapes intact)
+    src_vals = Pflat * valid_expand.to(Pflat.dtype)           # [B*C, H*W]
+
+    # Accumulate sums and counts per radial bin
+    sums = torch.zeros(B * C, nbins, device=x.device, dtype=P.dtype)
+    cnts = torch.zeros(B * C, nbins, device=x.device, dtype=P.dtype)
+
+    sums.scatter_add_(1, ridx_expand, src_vals)
+    cnts.scatter_add_(1, ridx_expand, valid_expand.to(P.dtype))
+
+    spec = sums / (cnts + 1e-12)                              # [B*C, nbins]
+    return spec.view(B, C, nbins)
 
 @torch.no_grad()
 def delta_w_ratio(module, prev_params, reduce_across_ranks=False, eps=1e-12):
@@ -1189,15 +1267,19 @@ class SU3HeadGellMannStochastic(nn.Module):
         nn.init.constant_(self.proj_logs.weight, 0.0)
         nn.init.constant_(self.proj_logs.bias, math.log(sigma0))  # σ≈sigma0 at start
 
-        # Gell-Mann / 2 (Hermitian, traceless)
-        L = torch.zeros(8, 3, 3, dtype=torch.complex64)
-        L[0,0,1] = L[0,1,0] = 1;        L[1,0,1] = -1j; L[1,1,0] =  1j
-        L[2,0,0] = 1; L[2,1,1] = -1;    L[3,0,2] = L[3,2,0] = 1
-        L[4,0,2] = -1j; L[4,2,0] = 1j;  L[5,1,2] = L[5,2,1] = 1
-        L[6,1,2] = -1j; L[6,2,1] = 1j;  s3 = 1.0 / (3.0**0.5)
-        L[7,0,0] = s3; L[7,1,1] = s3;   L[7,2,2] = -2*s3
-        self.register_buffer("lambdas", L / 2.0, persistent=False)
+        # L = torch.zeros(8, 3, 3, dtype=torch.complex64)
+        # L[0,0,1] = L[0,1,0] = 1;        L[1,0,1] = -1j; L[1,1,0] =  1j
+        # L[2,0,0] = 1; L[2,1,1] = -1;    L[3,0,2] = L[3,2,0] = 1
+        # L[4,0,2] = -1j; L[4,2,0] = 1j;  L[5,1,2] = L[5,2,1] = 1
+        # L[6,1,2] = -1j; L[6,2,1] = 1j;  s3 = 1.0 / (3.0**0.5)
+        # L[7,0,0] = s3; L[7,1,1] = s3;   L[7,2,2] = -2*s3
+        # self.register_buffer("lambdas", L / 2.0, persistent=False)
 
+        # Gell-Mann / 2 (Hermitian, traceless)
+        self.register_buffer("lambdas", su3_gellmann_matrices(), persistent=False)
+
+
+        
         # Noise coloring operators
         if self.sigma_mode == "conv":
             k, pad = self.noise_kernel, self.noise_kernel // 2
@@ -1742,28 +1824,8 @@ class SU3HeadGellMann(nn.Module):
         self.clamp_alphas = clamp_alphas
         self.alpha_vec_cap = alpha_vec_cap
         self.last_A_fro_mean = torch.tensor(0.0)
-        
-        # Complex Hermitian Gell-Mann matrices λ_a  (shape [8,3,3], complex)
-        L = torch.zeros(8, 3, 3, dtype=torch.complex64)
-        # λ1
-        L[0,0,1] = L[0,1,0] = 1
-        # λ2
-        L[1,0,1] = -1j; L[1,1,0] = 1j
-        # λ3
-        L[2,0,0] = 1; L[2,1,1] = -1
-        # λ4
-        L[3,0,2] = L[3,2,0] = 1
-        # λ5
-        L[4,0,2] = -1j; L[4,2,0] = 1j
-        # λ6
-        L[5,1,2] = L[5,2,1] = 1
-        # λ7
-        L[6,1,2] = -1j; L[6,2,1] = 1j
-        # λ8
-        s3 = 1.0 / (3.0**0.5)
-        L[7,0,0] = s3; L[7,1,1] = s3; L[7,2,2] = -2*s3
-        L = L / 2.
-        self.register_buffer("lambdas", L, persistent=False)
+
+        self.register_buffer("lambdas", su3_gellmann_matrices(), persistent=False)
 
     def forward(self, h: 'torch.Tensor', base18: 'torch.Tensor', Ymap: 'torch.Tensor') -> 'torch.Tensor':
         with torch.amp.autocast("cpu", enabled=False):   # keep disabled; MPS has no autocast mode
@@ -2592,7 +2654,9 @@ class GroupLossWithQs(GroupLoss):
         current_epoch: int = None,
         energy_weight: float = 0.,
         energy_grad_weight: float = 0.,
-        moment_weight: float = 0.
+        moment_weight: float = 0.,
+        spec_whiten_weight: float = 0.,
+        spec_guard_weight: float =0
     ):
         super().__init__(
             w_frob=w_frob, w_trace=w_trace, w_unit=w_unit, w_det=w_det,
@@ -2644,26 +2708,28 @@ class GroupLossWithQs(GroupLoss):
         self._lams_cached = None
         self.nll_stride = 1
         self.I3 = torch.eye(3, dtype=torch.cfloat)
-        print("[loss cfg] dipole_w=", self.dipole_weight, "qs_w=", self.qs_weight, "tr_w=", self.w_trace,
-              "geo_w=", self.geo_weight, "quad_weight=", self.quad_weight, "qs_slope_w=", self.qs_slope_weight, "nll_weight=", self.nll_weight, "energy_weight=", self.energy_weight)
         self.metrics_pg = _ddp_world_pg_or_none()
         self.crps_weight = float(crps_weight)
         self.spec_weight = float(spec_weight)
         self.moment_weight = float(moment_weight)
-        
+        self.spec_whiten_weight  = float(spec_whiten_weight)
+        self.spec_guard_weight = float(spec_guard_weight)
+
+        print("[loss cfg] dipole_w=", self.dipole_weight, "qs_w=", self.qs_weight,  "moment_w=", self.moment_weight, "quad_weight=", self.quad_weight, "nll_weight=", self.nll_weight, "energy_weight=", self.energy_weight, "spec_wighten_w=", self.spec_whiten_weight, "spec_guard_w=", self.spec_guard_weight)
 
         # --- Gell-Mann (λ/2) basis for projection (complex Hermitian) ---
-        L = torch.zeros(8, 3, 3, dtype=torch.cfloat)
+        self.register_buffer("lambdas", su3_gellmann_matrices(), persistent=False)
+        # L = torch.zeros(8, 3, 3, dtype=torch.cfloat)
 
-        L[1,0,1] = -1j; L[1,1,0] =  1j
-        L[4,0,2] = -1j; L[4,2,0] =  1j
-        L[6,1,2] = -1j; L[6,2,1] =  1j
-        L[0,0,1] = L[0,1,0] = 1.0
-        L[2,0,0] = 1.0; L[2,1,1] = -1.0
-        L[3,0,2] = L[3,2,0] = 1.0
-        L[5,1,2] = L[5,2,1] = 1.0
-        L[7,0,0] = 1.0/np.sqrt(3); L[7,1,1] = 1.0/np.sqrt(3); L[7,2,2] = -2.0/np.sqrt(3)
-        self.register_buffer("lambdas", L / 2.0, persistent=False)
+        # L[1,0,1] = -1j; L[1,1,0] =  1j
+        # L[4,0,2] = -1j; L[4,2,0] =  1j
+        # L[6,1,2] = -1j; L[6,2,1] =  1j
+        # L[0,0,1] = L[0,1,0] = 1.0
+        # L[2,0,0] = 1.0; L[2,1,1] = -1.0
+        # L[3,0,2] = L[3,2,0] = 1.0
+        # L[5,1,2] = L[5,2,1] = 1.0
+        # L[7,0,0] = 1.0/np.sqrt(3); L[7,1,1] = 1.0/np.sqrt(3); L[7,2,2] = -2.0/np.sqrt(3)
+        # self.register_buffer("lambdas", L / 2.0, persistent=False)
     #---- helpers --------------------------------------------------------
 
     def _dipole_curve_from_U(self, U: torch.Tensor, stride: int) -> torch.Tensor:
@@ -3131,7 +3197,7 @@ class GroupLossWithQs(GroupLoss):
         frob, trace_ms, unit, det, Uh, U, Uh_raw = self._components(yhat, y, reduction="mean")
 
         reduction = "mean"
-        
+    
         frob     = _reduce(frob,     reduction)
         trace_ms = _reduce(trace_ms, reduction)
         unit     = _reduce(unit,     reduction)
@@ -3397,18 +3463,20 @@ class GroupLossWithQs(GroupLoss):
             total = total + self.mono_weight * loss_mono
 
 
+        tuner = None
         # --- MOMENT loss (NLL-consistent, per-pixel, resolution-aligned) ---
         if getattr(self, "moment_weight", 0.0) > 0.0:
             if base18 is None:
                 raise RuntimeError("moment_weight>0 but base18 is None. Pass U0 (18-ch) to criterion(...).")
 
+            
             # 1) α supervision from (U0,U1) on a low-res grid; avoid bilinear up (it suppresses variance)
             with torch.no_grad():
                 # stronger unitarization for supervision (more stable α)
                 U0_full = self._su3_project(self._pack18_to_U(base18), iters=5)
                 U1_full = self._su3_project(self._pack18_to_U(y),      iters=5)   # <-- y must be ground truth
 
-                s       = int(getattr(self, "nll_map_stride", 2))
+                s       = int(getattr(self, "nll_map_stride", 1))
                 lams    = self.lambdas.to(device=U0_full.device, dtype=U0_full.dtype)
                 a_true  = self._alpha_map_from_pair(
                     U0_full, U1_full, lams,
@@ -3418,115 +3486,196 @@ class GroupLossWithQs(GroupLoss):
                 )  # [B, C, Hs, Ws]
 
 
-        # 2) Choose predicted drift/amp sources (amp ≡ σ per unit Y)
-        drift = drift_pred if (drift_pred is not None) else mu_pred
-        if amp_pred is not None:
-            sigma = amp_pred
-        elif logsig_pred is not None:
-            sigma = F.softplus(logsig_pred)
-        else:
-            sigma = None
-
-        if (drift is not None) and (sigma is not None):
-            # 3) Downsample to α grid
-            def to_alpha_grid(t, stride):
-                if stride <= 1: return t
-                if t.dim() != 4: raise ValueError("expect 4D [B,C,H,W] tensors")
-                return F.avg_pool2d(t, kernel_size=stride, stride=stride, ceil_mode=False)
-
-            drift_s = to_alpha_grid(drift, s)  # [B, Cd, Hs, Ws]
-
-            # >>> FIX #1: preserve variance correctly by pooling σ^2, not σ <<<
-            sigma2 = sigma.pow(2)
-            sigma2_s = to_alpha_grid(sigma2, s)            # [B, Ca, Hs, Ws]
-            # if sigma was broadcast-like, handle that path too:
-            if sigma2_s.shape[1] == 1 and drift_s.shape[1] != 1:
-                sigma2_s = sigma2_s.expand(drift_s.shape[0], drift_s.shape[1], *sigma2_s.shape[-2:])
-
-            # 4) Align batch & channels
-            B, C, Hs, Ws = a_true.shape
-            if drift_s.shape[0] != B: drift_s = drift_s[:B]
-            if sigma2_s.shape[0] != B: sigma2_s = sigma2_s[:B]
-            Cmin = min(C, drift_s.shape[1], sigma2_s.shape[1])
-            if Cmin != C:
-                a_true   = a_true[:,  :Cmin]
-                drift_s  = drift_s[:, :Cmin]
-                sigma2_s = sigma2_s[:, :Cmin]
-
-            # 5) Build dY and broadcast
-            if dy_scalar is None:
-                dY = torch.ones(B, 1, 1, 1, device=a_true.device, dtype=a_true.dtype)
+            # 2) Choose predicted drift/amp sources (amp ≡ σ per unit Y)
+            drift = drift_pred if (drift_pred is not None) else mu_pred
+ 
+            if logsig_pred is not None:
+                sigma = F.softplus(logsig_pred)
             else:
-                sdy = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:B]
-                dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
-                if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
+                sigma = None
 
-            eps = 1e-12
+            if (drift is not None) and (sigma is not None):
+                # 3) Downsample to α grid
+                def to_alpha_var_grid(var, stride):
+                    if stride <= 1:
+                        return var
+                    # avg_pool gives mean(var) over s×s; variance of the average needs another / s^2
+                    out = F.avg_pool2d(var, kernel_size=stride, stride=stride, ceil_mode=False)
+                    return out / float(stride * stride)
 
-            # Optional cap (looser to avoid bias-low); or remove and parameterize σ in the head instead
-            sigma2_min = float(getattr(self, "moment_sigma2_min", 1e-8))
-            sigma2_max = float(getattr(self, "moment_sigma2_max", 0.50**2))  # allow more headroom
-            sigma2_s = sigma2_s.clamp(min=sigma2_min, max=sigma2_max)
+                def to_alpha_grid(t, stride):
+                    if stride <= 1: return t
+                    if t.dim() != 4: raise ValueError("expect 4D [B,C,H,W] tensors")
+                    return F.avg_pool2d(t, kernel_size=stride, stride=stride, ceil_mode=False)
 
-            # Step moments
-            mu_step_s = drift_s * dY                         # [B,C,Hs,Ws]
-            vpred     = sigma2_s * dY                        # [B,C,Hs,Ws]
-            resid     = a_true - mu_step_s
+                drift_s = to_alpha_grid(drift, s)  # [B, Cd, Hs, Ws]
 
-            # >>> FIX #2: let a small fraction of grad hit σ to push it UP when needed <<<
-            rho = float(getattr(self, "moment_whiten_grad_mix", 0.))  # 0 (old detach) .. 1 (full grad)
-            v_whiten = (1.0 - rho) * vpred.detach() + rho * vpred
+                sigma2 = sigma.pow(2)
+                sigma2_s = to_alpha_var_grid(sigma2, s)            # [B, Ca, Hs, Ws]
+                # if sigma was broadcast-like, handle that path too:
+                if sigma2_s.shape[1] == 1 and drift_s.shape[1] != 1:
+                    sigma2_s = sigma2_s.expand(drift_s.shape[0], drift_s.shape[1], *sigma2_s.shape[-2:])
 
-            # 7) NLL-consistent pieces
-            # m1: whitened residual (encourages correct mean); partial grad to σ via rho
-            m1 = (resid.pow(2) / (v_whiten + eps)).mean()
+                # 4) Align batch & channels
+                B, C, Hs, Ws = a_true.shape
+                if drift_s.shape[0] != B: drift_s = drift_s[:B]
+                if sigma2_s.shape[0] != B: sigma2_s = sigma2_s[:B]
+                Cmin = min(C, drift_s.shape[1], sigma2_s.shape[1])
+                if Cmin != C:
+                    a_true   = a_true[:,  :Cmin]
+                    drift_s  = drift_s[:, :Cmin]
+                    sigma2_s = sigma2_s[:, :Cmin]
 
-            # m2: two-sided moment guard with deadzone, but underestimation gets a smaller weight
-            m2_pred = (mu_step_s.detach().pow(2) + vpred)    # detach μ to not bias mean via m2
-            m2_true = a_true.pow(2)
+                # 5) Build dY and broadcast
+                if dy_scalar is None:
+                    dY = torch.ones(B, 1, 1, 1, device=a_true.device, dtype=a_true.dtype)
+                else:
+                    sdy = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:B]
+                    dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
+                    if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
 
-            tau_over  = float(getattr(self, "moment_over_tau", 0.10))
-            tau_under = float(getattr(self, "moment_under_tau", 0.05))
+                eps = 1e-12
 
-            m2_over  = F.relu(m2_pred - (1.0 + tau_over)  * m2_true)
-            m2_under = F.relu((1.0 - tau_under) * m2_true - m2_pred)
+                # Optional cap (looser to avoid bias-low); or remove and parameterize σ in the head instead
+                sigma2_min = float(getattr(self, "moment_sigma2_min", 1e-8))
+                sigma2_max = float(getattr(self, "moment_sigma2_max", 0.50**2))  # allow more headroom
+                sigma2_s = sigma2_s.clamp(min=sigma2_min, max=sigma2_max)
 
-            w_over   = float(getattr(self, "moment_m2_over_weight", 0.25))  # stronger
-            w_under  = float(getattr(self, "moment_m2_under_weight", 0.10)) # gentler
-            m2 = (w_over * m2_over + w_under * m2_under).mean()
+                # Step moments
+                mu_step_s = drift_s * dY                         # [B,C,Hs,Ws]
+                vpred     = sigma2_s * dY                        # [B,C,Hs,Ws]
+                resid     = a_true - mu_step_s
 
-            # (Optional) smoothness on log σ to avoid speckle
-            h1_w = float(getattr(self, "moment_amp_h1", 0.0))
-            if h1_w > 0.0:
-                log_sigma_s = 0.5 * torch.log(sigma2_s + eps)               # log σ
-                dx = log_sigma_s[..., :, 1:] - log_sigma_s[..., :, :-1]
-                dy = log_sigma_s[..., 1:, :] - log_sigma_s[..., :-1, :]
-                m3 = (dx.pow(2).mean() + dy.pow(2).mean())
-            else:
-                m3 = torch.zeros((), device=a_true.device, dtype=a_true.dtype)
+                # >>> let a small fraction of grad hit σ to push it UP when needed <<<
+                rho = float(getattr(self, "moment_whiten_grad_mix", 0.1))  # 0 (old detach) .. 1 (full grad)
+                v_whiten = (1.0 - rho) * vpred.detach() + rho * vpred
 
-            # (Optional) weak prior nudging σ toward init (raise if you still see bias-low)
-            sigma0 = float(getattr(self, "moment_sigma0", 0.03))
-            lambda_sigma = float(getattr(self, "moment_sigma_prior", 0.0))  # e.g., 1e-3
-            m4 = lambda_sigma * (0.5*torch.log(sigma2_s + eps) - math.log(sigma0)).pow(2).mean()
+                # 7) NLL-consistent pieces
+                # m1: whitened residual (encourages correct mean); partial grad to σ via rho
+                m1 = (resid.pow(2) / (v_whiten + eps)).mean()
 
-            # 9) Weights
-            m1_w = float(getattr(self, "moment_m1_weight", 1.0))
-            m3_w = h1_w
+                # m2: two-sided moment guard with deadzone, but underestimation gets a smaller weight
+                m2_pred = (mu_step_s.detach().pow(2) + vpred)    # detach μ to not bias mean via m2
+                m2_true = a_true.pow(2)
 
-            moment_loss = m1_w * m1 + m2 + m3_w * m3 + m4
-            total = total + float(self.moment_weight) * moment_loss
+                tau_over  = float(getattr(self, "moment_over_tau", 0.10))
+                tau_under = float(getattr(self, "moment_under_tau", 0.05))
 
-            # Stats
-            stats["moment/m1"] = m1.detach()
-            stats["moment/m2_over"] = m2_over.mean().detach()
-            stats["moment/m2_under"] = m2_under.mean().detach()
-            if h1_w > 0.0: stats["moment/m3_tv"] = m3.detach()
-            if lambda_sigma > 0.0: stats["moment/m4_sigma_prior"] = m4.detach()
-            stats["moment/vpred_mean"] = vpred.mean().detach()
-            stats["moment/m2_pred_mean"] = m2_pred.mean().detach()
-            stats["moment/m2_true_mean"] = m2_true.mean().detach()
-            stats["moment/calib_ratio"] = (m2_pred.mean() / (m2_true.mean() + eps)).detach()
+                m2_over  = F.relu(m2_pred - (1.0 + tau_over)  * m2_true)
+                m2_under = F.relu((1.0 - tau_under) * m2_true - m2_pred)
+
+                w_over   = float(getattr(self, "moment_m2_over_weight", 0.25))  # stronger
+                w_under  = float(getattr(self, "moment_m2_under_weight", 0.10)) # gentler
+                m2 = (w_over * m2_over + w_under * m2_under).mean()
+
+                # (Optional) smoothness on log σ to avoid speckle
+                h1_w = float(getattr(self, "moment_amp_h1", 0.001))
+                if h1_w > 0.0:
+                    log_sigma_s = 0.5 * torch.log(sigma2_s + eps)               # log σ
+                    dx = log_sigma_s[..., :, 1:] - log_sigma_s[..., :, :-1]
+                    dy = log_sigma_s[..., 1:, :] - log_sigma_s[..., :-1, :]
+                    m3 = (dx.pow(2).mean() + dy.pow(2).mean())
+                else:
+                    m3 = torch.zeros((), device=a_true.device, dtype=a_true.dtype)
+
+                # (Optional) weak prior nudging σ toward init (raise if you still see bias-low)
+                sigma0 = float(getattr(self, "moment_sigma0", 0.02))
+                lambda_sigma = float(getattr(self, "moment_sigma_prior", 0.0))  # e.g., 1e-3
+                m4 = lambda_sigma * (0.5*torch.log(sigma2_s + eps) - math.log(sigma0)).pow(2).mean()
+
+                # 9) Weights
+                m1_w = float(getattr(self, "moment_m1_weight", 1.0))
+                m3_w = h1_w
+
+                moment_loss = m1_w * m1 + m2 + m3_w * m3 + m4
+
+
+                # ---- Spectral calibration (learn the spectrum of fluctuations) ----
+                spec_bins        = int(getattr(self, "spec_bins", min(Hs, Ws)//2))
+                spec_exclude_dc  = bool(getattr(self, "spec_exclude_dc", True))
+                spec_window      = bool(getattr(self, "spec_window", False))  # set True if boundaries aren't periodic
+
+                # (1) Whitened residual should be spectrally flat (white)
+                r         = resid / torch.sqrt(v_whiten + eps)                # [B,C,Hs,Ws]
+                Pr        = _iso_radial_power(r, nbins=spec_bins,
+                                              exclude_dc=spec_exclude_dc, window=spec_window)  # [B,C,K]
+                # For an orthonormal FFT, iid N(0,1) stays N(0,1) in k-space → target power ≈ 1
+                spec_flat = F.smooth_l1_loss(Pr, torch.ones_like(Pr), reduction='mean')
+
+                # (2) Match second moment in k-space (mean power + white-noise floor)
+                S_true  = _iso_radial_power(a_true, nbins=spec_bins,
+                                            exclude_dc=spec_exclude_dc, window=spec_window)
+                S_mu    = _iso_radial_power(mu_step_s.detach(), nbins=spec_bins,
+                                            exclude_dc=spec_exclude_dc, window=spec_window)
+
+                white   = vpred.mean(dim=(-2, -1), keepdim=False)             # [B,C]
+                S_noise = white.unsqueeze(-1).expand_as(S_mu)                 # [B,C,K]
+                S_pred  = S_mu + S_noise
+
+                tau_k      = float(getattr(self, "spec_tau", 0.10))
+                w_over_k   = float(getattr(self, "spec_over_weight", 0.25))
+                w_under_k  = float(getattr(self, "spec_under_weight", 0.10))
+
+                over_k   = F.relu(S_pred - (1.0 + tau_k)  * S_true)
+                under_k  = F.relu((1.0 - tau_k) * S_true - S_pred)
+                spec_guard = (w_over_k * over_k + w_under_k * under_k).mean()
+
+                # Weights and combine
+                spec_w_flat  = float(getattr(self, "spec_whiten_weight", 0.))   # e.g., 1e-2
+                spec_w_guard = float(getattr(self, "spec_guard_weight", 0.))    # e.g., 1e-2
+
+
+                moment_loss = moment_loss + spec_w_flat * spec_flat + spec_w_guard * spec_guard
+                total = total + float(self.moment_weight) * moment_loss
+
+                # ----- Per-sample fluctuation diagnostics for tuner -----
+                # 1) Per-sample χ² of whitened residuals (should be ~1 if calibrated)
+                #    Average over (C,H,W) for each sample.
+                chi2_map = (resid.pow(2) / (v_whiten + eps))           # [B,C,Hs,Ws]
+                fluct_chi2_per_sample = chi2_map.mean(dim=(1,2,3))     # [B]
+
+                # 2) Per-sample spectral relative L2 error between predicted and true power
+                #    S_* are [B, C, K]. Compute relL2 per channel then average over channels.
+                num_k = (S_pred - S_true).pow(2).sum(dim=-1)           # [B, C]
+                den_k = (S_true.pow(2).sum(dim=-1) + eps)              # [B, C]
+                relL2_per_ch = torch.sqrt(num_k / den_k)               # [B, C]
+                spec_relL2_per_sample = relL2_per_ch.mean(dim=1)       # [B]
+
+                # 3) A single weighted fluctuation metric per sample (you can tune weights)
+                w_chi2 = float(getattr(self, "tuner_w_chi2", 1.0))
+                w_spec = float(getattr(self, "tuner_w_spec", 0.05))
+                fluct_metric_per_sample = w_chi2 * fluct_chi2_per_sample + w_spec * spec_relL2_per_sample
+
+                # 4) Save ΔY per sample so we can bin by it in validation
+                #    (dy_scalar exists in your loss; if None we used ones above)
+                if dy_scalar is None:
+                    dy_batch = torch.ones(a_true.size(0), device=a_true.device, dtype=a_true.dtype)
+                else:
+                    dy_batch = dy_scalar.to(device=a_true.device, dtype=a_true.dtype).reshape(-1)[:a_true.size(0)]
+
+                # 5) Package a small dict to return (detach + cpu to be safe)
+                tuner = {
+                    "fluct_chi2_per_sample": fluct_chi2_per_sample.detach().float().cpu(),
+                    "spec_relL2_per_sample":  spec_relL2_per_sample.detach().float().cpu(),
+                    "fluct_metric_per_sample": fluct_metric_per_sample.detach().float().cpu(),
+                    "dy_per_sample":           dy_batch.detach().float().cpu(),
+                }
+                
+
+                # Stats
+                stats["moment/m1"] = m1.detach()
+                stats["moment/m2_over"] = m2_over.mean().detach()
+                stats["moment/m2_under"] = m2_under.mean().detach()
+                if h1_w > 0.0: stats["moment/m3_tv"] = m3.detach()
+                if lambda_sigma > 0.0: stats["moment/m4_sigma_prior"] = m4.detach()
+                stats["moment/vpred_mean"] = vpred.mean().detach()
+                stats["moment/m2_pred_mean"] = m2_pred.mean().detach()
+                stats["moment/m2_true_mean"] = m2_true.mean().detach()
+                stats["moment/calib_ratio"] = (m2_pred.mean() / (m2_true.mean() + eps)).detach()
+                stats["spec/flat"]          = spec_flat.detach()
+                stats["spec/guard"]         = spec_guard.detach()
+                stats["spec/calib_ratio_k"] = (S_pred.mean() / (S_true.mean() + eps)).detach()
+
 
                 
             # # 2) Choose predicted drift/amp sources (amp is σ per-unit-Y)
@@ -4053,7 +4202,8 @@ class GroupLossWithQs(GroupLoss):
 
                 stats['alpha_lammin_med'] = float(lam_min.median().detach())
 
-        return total, stats
+
+        return total, stats, tuner
 
     @torch.no_grad()
     def components_dict(self, yhat: 'torch.Tensor', y: 'torch.Tensor', base18: 'torch.Tensor' | None = None):
@@ -4910,6 +5060,8 @@ def train(args):
         quad_pairs     = _parse_quad_pairs_list(getattr(args, "quad_pairs", "auto_from_dipole"), dipole_offsets=dipole_offsets)
         w_crps = args.crps_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
         w_mom = args.moment_weight *ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_spec_w =  args.spec_whiten_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_spec_g =  args.spec_guard_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
         
         # Optional cap for the number of quadrupole configs (broader sets can be large)
         max_qp = int(getattr(args, "quad_max_pairs", 0) or 0)
@@ -4920,7 +5072,7 @@ def train(args):
             quad_pairs = tuple(tmp[:max_qp])
 
         criterion = GroupLossWithQs(
-            w_frob=0., w_unit=0.01,
+            w_frob=0., w_unit=0.0,
             geo_weight=w_geo, dir_weight=w_dir, w_trace=w_tr,
             dipole_weight=w_dip, dipole_slope_weight=w_dip_slope, dipole_offsets=dipole_offsets,
             qs_weight=w_qs, qs_threshold=0.5, qs_on='N', qs_local=True,
@@ -4928,6 +5080,8 @@ def train(args):
             qs_soft_slope=args.qs_soft_slope,
             crps_weight=w_crps,
             moment_weight=w_mom,
+            spec_whiten_weight=w_spec_w,
+            spec_guard_weight=w_spec_g,
             quad_weight=w_quad, quad_pairs=quad_pairs,
             mono_weight=float(getattr(args,"mono_weight",0.0)),
             qs_slope_weight=float(getattr(args,"qs_slope_weight",0.0)),
@@ -5049,7 +5203,7 @@ def train(args):
 #                t0=time.perf_counter()
 #                #----end-time----
         
-                loss, stats = criterion(
+                loss, stats, tuner = criterion(
                     yhat, y, base18,
                     dy_scalar=Y_scalar,          # [B]
                     theta=theta,                 # [B,3]
@@ -5080,17 +5234,19 @@ def train(args):
 
                 # one-step ΔY (float or tensor) -> batch tensor
                 dY_step_val = steps_to_Y(1, ds_value.item() if torch.is_tensor(ds_value) else ds_value)
-                Y_scalar = as_B1111(dY_step_val, base18)   # [B,1,1,1]
-#                dY = steps_to_Y(1, ds_value)
-                
+                Y_scalar_r = as_B1111(dY_step_val, base18)   # [B,1,1,1]
+                #                dY = steps_to_Y(1, ds_value)
+                Y_limit = core.y_max-rollout_k*dY_step_val
+#                print(core.y_max, Y_limit)
+
                 if (base18.device.type == "cpu") and bool(getattr(args, "skip_heavy_on_cpu", True)):
                     w_state = 0.0
                     w_single = 0.0
 
-                if rollout_k > 1 and (w_state > 0.0 or w_single > 0.0):
+                if rollout_k > 1 and (w_state > 0.0 or w_single > 0.0 and Y_scalar < Y_limit):
                     #start from final U (called y) and evolve k steps
                     yhat_roll, yhat_single_big = rollout_predict(
-                        model, y, Y_scalar, rollout_k, theta,
+                        model, y, Y_scalar_r, rollout_k, theta,
                         track_grad=True
                     )
 
@@ -5105,8 +5261,8 @@ def train(args):
  
                     if w_single > 0.0:
                         # transitions from each predicted state (grads OK)
-                        next_from_roll,  _ = model(yhat_roll.detach().clone(),       Y_scalar, theta, sample=False, dY=Y_scalar)
-                        next_from_big,   _ = model(yhat_single_big.detach().clone(), Y_scalar, theta, sample=False, dY=Y_scalar)
+                        next_from_roll,  _ = model(yhat_roll.detach().clone(),       Y_scalar_r, theta, sample=False, dY=Y_scalar_r)
+                        next_from_big,   _ = model(yhat_single_big.detach().clone(), Y_scalar_r, theta, sample=False, dY=Y_scalar_r)
                         Nr = dipole_from_links18(next_from_roll, offsets=sg_offsets)
                         Nb = dipole_from_links18(next_from_big,  offsets=sg_offsets)
                         rollout_single_loss = F.mse_loss(Nr, Nb)
@@ -5159,57 +5315,51 @@ def train(args):
 
 
                 # --- semigroup ---
-                # --- semigroup on dipoles instead of Wilson lines ---
                 use_sg = (args.semigroup_weight > 0) and (torch.rand(()) < getattr(args, "semigroup_prob", 1.0))
                 use_sg = use_sg and not (getattr(args, "skip_heavy_on_cpu", False) and not torch.cuda.is_available())
                 
                 if use_sg:
                 # Split Y into two parts: Y_a + Y_b = Y
-                    # Option 1: random split
                     split = torch.rand((), device=base18.device)
                     Y_a = Y_scalar * split         # [B]
                     Y_b = Y_scalar - Y_a           # [B]
-                    # (Option 2: deterministic half-split)
-                    # Y_a = 0.5 * Y_scalar
-                    # Y_b = Y_scalar - Y_a
-                    # (Keep your existing code that creates Y_a, Y_b and runs the model twice.)
-                    #
-                    # Example skeleton (match to your variable names):
+
                     u_a, extras       = model(base18, Y_a, theta, sample=False)
                     u_comp, extras    = model(u_a,   Y_b, theta, sample=False)          # two-step (compose)
                     u_direct, extras  = model(base18, Y_a + Y_b, theta, sample=False)   # one-step (direct)
 
                     U_comp   = criterion._pack18_to_U(u_comp)      # exp(-A(Y_b)) exp(-A(Y_a)) U0
                     U_direct = criterion._pack18_to_U(u_direct)    # exp(-A(Y_a+Y_b)) U0
-                    
-                    D = U_comp.conj().transpose(-1,-2) @ U_direct  # should be ~ I
-                    # principal log for unitary: eigendecompose and map eigenvalues' phases
-                    evals, evecs = torch.linalg.eig(D)
-                    angles = torch.angle(evals).to(D.dtype)        # principal angles in (-π,π]
-                    L = evecs @ torch.diag_embed(1j * angles) @ torch.linalg.inv(evecs)
-                    L = 0.5 * (L - L.conj().transpose(-1,-2))      # enforce anti-Hermitian
-                    L_sg = (L.abs()**2).sum(dim=(-2,-1)).mean()    # ||log(D)||_F^2 averaged
-                    loss = loss + float(args.semigroup_weight) * L_sg
-                    meters.add("train/semigroup_geodesic", L_sg.detach(), base18.size(0))
 
 
-                    # # using your mapper once (make sure to pass lams if needed)
-                    # a_comp = criterion._alpha_map_from_pair(criterion._pack18_to_U(u_comp),  criterion._pack18_to_U(base18), criterion._get_lams, stride=2)
-                    # a_dir  = criterion._alpha_map_from_pair(criterion._pack18_to_U(u_direct), criterion._pack18_to_U(base18), criterion._get_lams, stride=2)
+                    Delta = U_comp.mH.contiguous() @ U_direct                      # [B,H',W',3,3]
+                    I = criterion.I3.to(Delta.device, Delta.dtype)
 
-                    # # per-pixel α residual (L2) + tiny Sobolev to avoid pixel noise
-                    # R = a_comp - a_dir
-                    # L_sg_alpha = R.pow(2).mean()
-                    # if getattr(args, "semigroup_alpha_h1", 0.0) > 0:
-                    #     dx = R[..., :, 1:] - R[..., :, :-1]
-                    #     dy = R[..., 1:, :] - R[..., :-1, :]
-                    #     L_sg_alpha = L_sg_alpha + float(args.semigroup_alpha_h1) * (dx.pow(2).mean() + dy.pow(2).mean())
+                    # Fast Hermitian generator (no eig)
+                    S = 0.5j * (Delta.mH.contiguous() - Delta)           # [B,H',W',3,3]
 
-                    # loss = loss + float(args.semigroup_weight) * L_sg_alpha
-                    # meters.add("train/semigroup_alpha", L_sg_alpha.detach(), base18.size(0))
-                  
+                    # Mask sites where Δ is not close to I (Frobenius norm per site)
+                    # normalize by sqrt(3) to keep threshold in ~[0,1]
+                    frob = torch.linalg.matrix_norm(Delta - I, ord='fro', dim=(-2,-1)) / (3.0**0.5)
+                    mask = (frob > 0.1)
 
-                
+                    if mask.any():
+                        Dv = Delta.reshape(-1, 3, 3)
+                        mv = mask.reshape(-1)
+                        De = Dv[mv] #subset of Delta matrices that are far from identity
+                        # light projection for stability, complex64 eig is faster
+                        De = criterion._su3_project(De, iters=1) #nudges all Deltas in our list back to SU(3)
+                        w, V = torch.linalg.eig(De.to(torch.complex64))  #extract theta and V of De = V diag(exp(i theta) V^{-1}
+                        theta = torch.atan2(w.imag, w.real)
+                        L = V @ torch.diag_embed(1j * theta) @ torch.linalg.inv(V) #construct the matrix log: L = log(De) = V diag (i theta) V^{-1}
+                        L = L.contiguous(); Lh = L.mH.contiguous()
+                        S = -0.5j * (L - Lh)                          # Hermitian - it works? with 0.5*(L-Lh) . at least fluctuations come out much smaller. replace above two lines with this.
+                        
+                        L_sg = (S.abs()**2).sum(dim=(-2,-1)).mean()    # ||log(D)||_F^2 averaged
+                        loss = loss + float(args.semigroup_weight) * L_sg
+                        meters.add("train/semigroup_geodesic", L_sg.detach(), base18.size(0))
+
+                                 
             meters.add("train/frob", stats["frob"], base18.size(0))
             meters.add("train/unit", stats["unit"], base18.size(0))
                     
@@ -5427,9 +5577,13 @@ def train(args):
         # Accumulators for Y-evolution diagnostics
         val_qslope_list = []
         val_mono_list   = []
-        val_dy_all, val_qp_all, val_qt_all = [], [], []
+        val_qp_all, val_qt_all, val_dy_qs_all, val_dy_tuner_all = [], [], [], []
+        #val_dy_all, val_qp_all, val_qt_all = [], [], []
         val_q4p_all, val_q4t_all = [], []  # accumulate quadrupole preds/targets per batch
-        
+        val_fluc_chi2_all = []
+        val_spec_relL2_all = []
+        val_fluct_metric_all = []
+    
         if val_sampler is not None:
             try: val_sampler.set_epoch(epoch)
             except Exception: pass
@@ -5490,7 +5644,7 @@ def train(args):
         #         "Qs_pred_at_Qsmax_true_px": None,
         #     }
 
-
+        
         with torch.no_grad():
             for i, (base18, Y_scalar, theta, y) in enumerate(val_dl):
                 base18   = base18.to(device, non_blocking=True)
@@ -5516,7 +5670,7 @@ def train(args):
                         core = unwrap(model)
                         mu_pred     = extras.get("mu")
 
-                        logsig_pred = extras.get("logsig")
+                    logsig_pred = extras.get("logsig")
                         
                     # y_gate is optional; define safely for this scope
                     try:
@@ -5526,7 +5680,7 @@ def train(args):
                         y_gate = None
                     
 
-                    l, stats_val = criterion(
+                    l, stats_val, tuner = criterion(
                         yh, y, base18,
                         dy_scalar = Y_scalar,
                         theta=theta,                     # [B,3] for the composer
@@ -5557,8 +5711,8 @@ def train(args):
                     qt = criterion._compute_Qs_from_U(Ut, local=False)  # [B]
                     val_qp_all.append(qp.detach().cpu().numpy())
                     val_qt_all.append(qt.detach().cpu().numpy())
-                    val_dy_all.append(dy_scalar.view(-1).detach().cpu().numpy())
-
+#                    val_dy_all.append(dy_scalar.view(-1).detach().cpu().numpy())
+                    val_dy_qs_all.append(dy_scalar.view(-1).detach().cpu().numpy())
                 except Exception:
                     pass
 
@@ -5684,7 +5838,17 @@ def train(args):
                     v, s, g = monitor_a_fluct(pred, y)
                     print(f"[a] var≈{v:.2f}  slope≈{s:.2f}  grad≈{g:.2f}")
 
-
+                if (tuner is not None):
+                    fchi = tuner.get("fluct_chi2_per_sample", None)
+                    frel = tuner.get("spec_relL2_per_sample",  None)
+                    fmet = tuner.get("fluct_metric_per_sample", None)
+                    dyp  = tuner.get("dy_per_sample", None)
+               
+                    if fchi is not None: val_fluc_chi2_all.append(fchi.numpy().reshape(-1))
+                    if frel is not None: val_spec_relL2_all.append(frel.numpy().reshape(-1))
+                    if fmet is not None: val_fluct_metric_all.append(fmet.numpy().reshape(-1))
+                    #if dyp  is not None: val_dy_all.append(dyp.numpy().reshape(-1))
+                    if dyp  is not None: val_dy_tuner_all.append(dyp.numpy().reshape(-1))
         # one diagnostic print per epoch (ok if it syncs internally)
         try:
             with torch.no_grad():
@@ -5812,8 +5976,9 @@ def train(args):
             #           f"(sample’s mean Qs_pred={qs_stats['Qs_pred_at_Qsmax_true_px']:.6e})  "
             #           f"at Y={qs_stats['Y_at_Qsmax_true_px']:.6e}")
 
-        if len(val_dy_all):
-            dy = np.concatenate(val_dy_all)  # [N]
+        if len(val_dy_qs_all):
+            dy = np.concatenate(val_dy_qs_all)  # [N]        if len(val_dy_all):
+            #dy = np.concatenate(val_dy_all)  # [N]
             qp = np.concatenate(val_qp_all)  # [N]
             qt = np.concatenate(val_qt_all)  # [N]
             # ΔY quantile bins (4 bins: quartiles)
@@ -5917,13 +6082,85 @@ def train(args):
                     "epoch": int(epoch),
                     "qs_rmse_bins": [float(x) if _np.isfinite(x) else None for x in rmse_bins],
                     "qs_rmse_combined": qs_combined,
-                    #"q4_rmse_bins_per_pair": q4_rmse_bins,            # list[len=4] of lists[len=n_pairs]
+#                    "q4_rmse_bins_per_pair": q4_rmse_bins,            # list[len=4] of lists[len=n_pairs]
                     "q4_rmse_bins_mean": q4_rmse_bins_mean,           # per-bin mean across pairs
                     "q4_rmse_combined": q4_combined,                  # weighted across bins & pairs
-                    "combined_rmse_total": combined_total             # single scalar for tuner
+                    "combined_rmse_total": combined_total,             # single scalar for tuner
                 }
+
+                #add fluctuation measures
+                if (tuner is not None):
+                    def _bin_means_and_weighted_rms(vals, dy, edges):
+                        """
+                        vals: [N] array, one value per sample
+                        dy:   [N] array of ΔY
+                        edges: bin edges used for your Qs/Q4 stats
+                        Returns:
+                        means_per_bin: list of float or nan
+                        counts_per_bin: list of int
+                        combined_rms: float (sqrt of count-weighted mean of bin-means^2)
+                        """
+                        means, counts = [], []
+                        for i in range(len(edges)-1):
+                            m = (dy >= edges[i]) & (dy < edges[i+1] if i < len(edges)-2 else dy <= edges[i+1])
+                            counts.append(int(m.sum()))
+                            if m.any():
+                                means.append(float(_np.nanmean(vals[m])))
+                            else:
+                                means.append(float("nan"))
+                        num = 0.0; den = 0
+                        for v, c in zip(means, counts):
+                            if _np.isfinite(v):
+                                num += c * (v*v)
+                                den += c
+                        combined = float(_np.sqrt(num / max(den, 1))) if den > 0 else float("nan")
+                        return means, counts, combined
+
+                    # concat the per-sample arrays
+                    fluc_chi2 = _np.concatenate(val_fluc_chi2_all, axis=0) if len(val_fluc_chi2_all) else _np.array([])
+                    spec_relL2 = _np.concatenate(val_spec_relL2_all, axis=0) if len(val_spec_relL2_all) else _np.array([])
+                    fluct_metric = _np.concatenate(val_fluct_metric_all, axis=0) if len(val_fluct_metric_all) else _np.array([])
+                    #dy_vec = _np.concatenate(val_dy_all, axis=0) if len(val_dy_all) else _np.array([])
+                    dy_vec = _np.concatenate(val_dy_tuner_all, axis=0) if len(val_dy_tuner_all) else (_np.concatenate(val_dy_qs_all, axis=0) if len(val_dy_qs_all) else _np.array([]))                    
+                    fluc_chi2_bins_mean = []; spec_relL2_bins_mean = []; fluct_metric_bins_mean = []
+                    fluct_chi2_err = float("nan"); spec_relL2_err = float("nan"); fluct_metric_err = float("nan")
+                
+                    if dy_vec.size:
+                        if fluc_chi2.size == dy_vec.size:
+                            fluc_chi2_bins_mean, _, fluct_chi2_err = _bin_means_and_weighted_rms(fluc_chi2, dy_vec, edges)
+                        if spec_relL2.size == dy_vec.size:
+                            spec_relL2_bins_mean, _, spec_relL2_err = _bin_means_and_weighted_rms(spec_relL2, dy_vec, edges)
+                        if fluct_metric.size == dy_vec.size:
+                            fluct_metric_bins_mean, _, fluct_metric_err = _bin_means_and_weighted_rms(fluct_metric, dy_vec, edges)
+                    
+
+                    tuner_payload.update({
+                        "fluc_chi2_bins_mean": fluc_chi2_bins_mean,   # per-ΔY-bin means
+                        "spec_relL2_bins_mean": spec_relL2_bins_mean,
+                        "fluct_metric_bins_mean": fluct_metric_bins_mean,
+                        
+                        "fluct_chi2_err": float(fluct_chi2_err),      # single scalar
+                        "spec_relL2": float(spec_relL2_err),          # single scalar
+                        "fluct_metric": float(fluct_metric_err),      # single scalar
+                    })
+
+                    # Optional overall scalar that your tuner optimizes
+                    w_rmse = 1.0
+                    w_fluc = float(os.getenv("TUNER_W_FLUC", "0.01"))
+                    tuner_payload["tuner_total"] = float(
+                        w_rmse * tuner_payload["combined_rmse_total"] +
+                        w_fluc * tuner_payload["fluct_metric"]
+                    )
+                else:
+                    tuner_payload["tuner_total"] = float(
+                        tuner_payload["combined_rmse_total"] )
+                    
+                    
                 print("TUNER_METRIC " + json.dumps(tuner_payload), flush=True)
-                print("TUNER_SCALAR ", combined_total)
+                print("TUNER_SCALAR ", tuner_payload["tuner_total"])
+
+                
+
             except Exception as _e:
                 # Keep training robust if diagnostics fail
                 if ((not is_ddp) or dist.get_rank()==0):
@@ -5969,8 +6206,8 @@ def train(args):
 
         # Save best
         outdir = Path(args.out)
-        if ((not is_ddp) or dist.get_rank() == 0) and val_loss < best:
-            best = val_loss
+        if ((not is_ddp) or dist.get_rank() == 0) and combined_total < best:
+            best = combined_total
 
 
             ckpt = {
@@ -6086,6 +6323,9 @@ def main():
     
     ap.add_argument("--crps_weight", type=float, default=0.0, help="Weight for Gaussian CRPS on α (proper scoring rule).")
     ap.add_argument("--moment_weight", type=float, default=0.0, help="Weight for MOMENT loss (NLL-consistent, per-pixel, resolution-aligned).")
+    ap.add_argument("--spec_whiten_weight", type=float, default=0.0, help="Weight for spectral loss (spec_flat forces the whitened residual to be spectrally flat. If you leave structured power in the residual, this term pushes the model to explain it with the mean (drift) and/or raise σ where needed).")
+    ap.add_argument("--spec_guard_weight", type=float, default=0.0, help="Weight for spectral loss (spec_guard calibrates the power spectrum of the step: predicted mu_step power + the white floor implied by v_pred should match the true spectrum per k-bin (with deadzones so it’s robust).")
+    
     ap.add_argument("--nll_target_mode", type=str, default="none", choices=["per_dy","per_ysigma","none"], help="How to scale S to match head’s μ-space.")
     ap.add_argument("--quad_weight", type=float, default=0.0, help="Weight for quadrupole loss.")
     ap.add_argument("--rough_weight", type=float, default=0., help="Weight for fluctuation scale loss.")
