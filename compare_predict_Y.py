@@ -1204,8 +1204,8 @@ def main():
     y_max_data = float(max(y_vals))
     
     # make the model use that normalization
-    if hasattr(model, "y_min_buf"): model.y_min_buf.fill_(y_min_data)
-    if hasattr(model, "y_max_buf"): model.y_max_buf.fill_(y_max_data)
+#    if hasattr(model, "y_min_buf"): model.y_min_buf.fill_(y_min_data)
+#    if hasattr(model, "y_max_buf"): model.y_max_buf.fill_(y_max_data)
     
     print(f"[debug] using y_min={y_min_data:.6g}, y_max={y_max_data:.6g}")
 

@@ -36,6 +36,13 @@ _RADIAL_CACHE = {}  # key: (H, W, device) -> (bins[H,W] long, counts[L] long)
 
 import torch, torch.distributed as dist
 
+def get_noise_core_fn(model):
+    """Return a callable like lambda x: model.head._noise_core(x), or None."""
+    m = model.module if hasattr(model, "module") else model
+    head = getattr(m, "head", None)
+    core = getattr(head, "_noise_core", None) if head is not None else None
+    return (lambda x: core(x)) if core is not None else None
+
 # --- Canonical SU(3) Gell-Mann matrices (optionally divided by 2) ---
 def su3_gellmann_matrices(
     *, dtype: torch.dtype = torch.complex64,
@@ -1246,7 +1253,7 @@ class SU3HeadGellMannStochastic(nn.Module):
                  A_cap: float | None = None,
                  sigma0: float = 0.03,             # σ init per unit Y
                  sigma_mode: str = "conv",         # "diag" | "conv" | "spectral"
-                 noise_kernel: int = 5):
+                 noise_kernel: int = 9):
         super().__init__()
         assert alpha_channels in (8, 16), "alpha_channels must be 8 or 16"
         self.C = alpha_channels
@@ -2656,7 +2663,8 @@ class GroupLossWithQs(GroupLoss):
         energy_grad_weight: float = 0.,
         moment_weight: float = 0.,
         spec_whiten_weight: float = 0.,
-        spec_guard_weight: float =0
+        spec_guard_weight: float =0,
+        sigma_mode: str = "conv",         # "diag" | "conv" | "spectral"
     ):
         super().__init__(
             w_frob=w_frob, w_trace=w_trace, w_unit=w_unit, w_det=w_det,
@@ -2664,6 +2672,7 @@ class GroupLossWithQs(GroupLoss):
             geo_weight=geo_weight, dir_weight=dir_weight,
             dipole_weight=dipole_weight, dipole_offsets=dipole_offsets,
         )
+        self.sigma_mode = sigma_mode
         self.dipole_weight = float(dipole_weight)
         self.dipole_slope_weight = float(dipole_slope_weight)
         self.energy_grad_weight = float(energy_grad_weight)
@@ -3078,6 +3087,7 @@ class GroupLossWithQs(GroupLoss):
         return Qs  # shape: [B] or [B,H,W]
 
         # --- put inside your loss class ---
+
     def _spec_loss_pack18(self, P18, T18, margin=0.08, high_over=0.05, eps=1e-12):
         """
         P18, T18: pack-18 fields shaped [B,18,H,W] or [B,H,W,18]
@@ -3129,6 +3139,7 @@ class GroupLossWithQs(GroupLoss):
 
         C = float(C)
         return Lshape / C, Lamp / C, Lhigh / C
+
     def _quadrupole(self, U: torch.Tensor) -> torch.Tensor:
         U_q = U if self.project_before_frob else self._su3_project(U)  # [B,H,W,3,3] complex
         outs = []
@@ -3183,6 +3194,24 @@ class GroupLossWithQs(GroupLoss):
         return a
     
 
+    def _get_white_shape(self, Hs, Ws, nbins, exclude_dc, window, device, dtype):
+        # Cache by geometry + settings to avoid recomputing every step
+        key = (Hs, Ws, nbins, bool(exclude_dc), bool(window))
+        if not hasattr(self, "_spec_white_cache"): self._spec_white_cache = {}
+        if key in self._spec_white_cache:
+            return self._spec_white_cache[key].to(device=device, dtype=dtype)
+        with torch.no_grad():
+            B, C = 4, 4  # small batch/channels for estimate
+            z = torch.randn(B, C, Hs, Ws, device=device, dtype=dtype)
+            # unit variance white field → expected power shape
+            Wk = _iso_radial_power(z, nbins=nbins, exclude_dc=exclude_dc, window=window)  # [B,C,K]
+            Wk = Wk.mean(dim=(0,1))  # [K]
+            # Avoid zeros
+            Wk = torch.clamp(Wk, min=1e-12)
+            self._spec_white_cache[key] = Wk.detach().clone().cpu()
+            return Wk
+
+        
     def forward(self, yhat: 'torch.Tensor', y: 'torch.Tensor',
                 base18: 'torch.Tensor' | None = None,
                 dy_scalar: 'torch.Tensor' | None = None,
@@ -3192,7 +3221,8 @@ class GroupLossWithQs(GroupLoss):
                 drift_pred: 'torch.Tensor' | None = None,
                 amp_pred: 'torch.Tensor' | None = None,
                 y_gate: 'torch.Tensor' | None = None,
-                return_stats: bool = False):
+                return_stats: bool = False,
+                noise_core_fn=None):
 
         frob, trace_ms, unit, det, Uh, U, Uh_raw = self._components(yhat, y, reduction="mean")
 
@@ -3386,57 +3416,156 @@ class GroupLossWithQs(GroupLoss):
         #t0=time.perf_counter()
         ##----end-time----
 
-        if getattr(self, "crps_weight", 0.0) != 0.0 and (logsig_pred is not None) and (mu_pred is not None):
+        #Continuous Ranked Probability Score learns fluctuations: Proper and robust: encourages calibrated quantiles; much less sensitive to outliers than NLL (no big log σ penalty spikes).
+        if (logsig_pred is not None) and (mu_pred is not None):
+            eps = 1e-12
+            dtype = mu_pred.dtype
+            device = mu_pred.device
+
             with torch.no_grad():
+                # Build a_true on the α-grid (low-res), like in your moment loss
                 U0 = self._su3_project(self._pack18_to_U(base18), iters=1)
                 U1 = self._su3_project(self._pack18_to_U(y),      iters=1)
-                lams   = self._get_lams(U0)          # caches & dtype/device-safe
+                lams   = self._get_lams(U0)
                 stride = int(getattr(self, "nll_map_stride", 1))
-                a_true = self._alpha_map_from_pair(U0, U1, lams, stride=stride,
-                                                   fast_thresh=getattr(self, "nll_fast_thresh", 0.15),
-                                                   proj_iters=1)
-                if stride > 1:
-                    _, _, Ht, Wt = mu_pred.shape
-                    a_true = F.interpolate(a_true, size=(Ht, Wt), mode='bilinear', align_corners=False)
-                if a_true.shape[1] != mu_pred.shape[1]:
-                    a_true = a_true[:, :mu_pred.shape[1]]
-    # ...
+                a_true = self._alpha_map_from_pair(
+                    U0, U1, lams,
+                    stride=stride,
+                    fast_thresh=getattr(self, "nll_fast_thresh", 0.15),
+                    proj_iters=1
+                )  # [B,Ca,Hs,Ws]
 
+            # Downsample predictions to the α grid (match what you do in moment loss)
+            def _to_alpha_grid(t, s):
+                if s <= 1: return t
+                if t.dim() != 4: raise ValueError("expect [B,C,H,W]")
+                return F.avg_pool2d(t, kernel_size=s, stride=s, ceil_mode=False)
 
-    #     if getattr(self, "crps_weight", 0.0) != 0.0 and (logsig_pred is not None) and (mu_pred is not None):
-    #         eps = 1e-12
+            def _to_alpha_var_grid(var, s):
+                if s <= 1: return var
+                out = F.avg_pool2d(var, kernel_size=s, stride=s, ceil_mode=False)
+                # variance of the average over s×s adds another / s^2
+                return out / float(s*s)
 
-    #         B, C, H, W = mu_pred.shape
+            # Match channels
+            mu_s    = _to_alpha_grid(mu_pred, stride)                     # [B,C?,Hs,Ws]
+            sigma2  = F.softplus(logsig_pred).to(dtype=dtype).pow(2)      # σ^2 per unit Y
+            sigma2s = _to_alpha_var_grid(sigma2, stride)                   # [B,C?,Hs,Ws]
 
-    #         if isinstance(dy_scalar, torch.Tensor):
-    #             s = dy_scalar.to(mu_pred.device, mu_pred.dtype).view(-1)
-    #             if s.numel() == 1:
-    #                 s = s.expand(B)
-    #             elif s.numel() != B:
-    #                 s = s.reshape(B, -1).mean(dim=1)
-    #         else:
-    #             s = torch.tensor([float(dy_scalar)], device=mu_pred.device, dtype=mu_pred.dtype).expand(B)
-    #         dY_map = s.view(B, 1, 1, 1).clamp_min(eps)
-    #         mu_step = mu_pred * dY_map
-          
-    #         a_true = self._alpha_map_from_pair(
-    #             U0, U1, lams,
-    #             stride=stride,
-    #             fast_thresh=getattr(self, "nll_fast_thresh", 0.15),
-    #             proj_iters=1
-    #         )  # [B,C',H',W']
+            B,Ct,Hs,Ws = a_true.shape
+            # Align batch & channels
+            if mu_s.shape[0] != B:    mu_s    = mu_s[:B]
+            if sigma2s.shape[0] != B: sigma2s = sigma2s[:B]
+            Cmin = min(Ct, mu_s.shape[1], sigma2s.shape[1])
+            a_true  = a_true[:,  :Cmin]
+            mu_s    = mu_s[:,    :Cmin]
+            sigma2s = sigma2s[:, :Cmin]
 
-            log_sigma_unit = torch.log(torch.nn.functional.softplus(logsig_pred) + eps)  # [B,C,H,W]
-            # log variance for the step: log(σ^2 ΔY) = 2 logσ + log ΔY
-            logvar_step = 2.0 * log_sigma_unit + torch.log(dY_map)
-            sig_step = torch.exp(0.5 * logvar_step)           # [B,C,H,W]
-            z = (a_true - mu_step) / (sig_step + 1e-12)       # standard residual
+            # ΔY map on α grid (ensure positivity)
+            if dy_scalar is None:
+                dY = torch.ones(B, 1, 1, 1, device=device, dtype=dtype)
+            else:
+                sdy = dy_scalar.to(device=device, dtype=dtype).reshape(-1)[:B]
+                dY  = (sdy.mean() if sdy.numel()==0 else sdy).view(-1,1,1,1)
+                if dY.shape[0] == 1: dY = dY.expand(B,1,1,1)
+            dY_abs = dY.abs().clamp_min(eps)
+
+            # Step stats: μ_step and σ_step
+            mu_step   = mu_s * dY                                         # [B,C,Hs,Ws]
+            sigma2min = float(getattr(self, "moment_sigma2_min", 1e-8))
+            sigma2max = float(getattr(self, "moment_sigma2_max", 1.0))    # give headroom
+            sigma2s   = sigma2s.clamp(min=sigma2min, max=sigma2max)
+
+            sig_step  = torch.sqrt(sigma2s * dY_abs).clamp_min(1e-6)      # [B,C,Hs,Ws]
+            mu_anchor = mu_step.detach() #detach mu so this loss does not mess with it 
+            z         = (a_true - mu_anchor) / sig_step
+
+            # Gaussian CRPS (closed form)
+            # Φ and φ; use erf or ndtr; both fine
             Phi = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
             phi = torch.exp(-0.5 * z*z) / math.sqrt(2.0*math.pi)
             crps = sig_step * (z * (2.0*Phi - 1.0) + 2.0*phi - 1.0/math.sqrt(math.pi))
-            loss_crps = crps.mean()
-            total = total + self._wb('crps', loss_crps, getattr(self, 'crps_weight', 0.0))
 
+            loss_crps = crps.mean()
+            total = total + self._wb('crps', loss_crps, float(getattr(self, 'crps_weight', 0.0)))
+
+            # Optional diagnostics
+            with torch.no_grad():
+                stats["crps/mean"]     = loss_crps.detach()
+                stats["crps/|z|_mean"] = z.abs().mean().detach()
+                stats["crps/sig_mean"] = sig_step.mean().detach()
+
+
+            # --- teach the noise-core correlation (no effect on μ) ---
+
+            # 1) Target: normalized residual on the α-grid (teacher-forced)
+            eps = 1e-12
+            resid = a_true - (mu_s * dY)                               # [B,C,Hs,Ws]
+            r = resid / torch.sqrt(sigma2s.clamp_min(1e-8) * dY + eps) # ≈ N(0, Σ_space)
+
+            # 3) Match spectra (or k-wise second moments). Isotropic radial power per channel:
+            def iso_radial_power(x: torch.Tensor, nbins: int | None = None, eps: float = 1e-12) -> torch.Tensor:
+                """
+                Radial power spectrum averaged over batch and channels.
+                x:     [B, C, H, W], real-valued field(s)
+                nbins: number of radial bins; if None, uses min(H, W)//2
+                returns: [nbins] tensor on x.device
+                """
+                assert x.dim() == 4, f"expected [B,C,H,W], got {x.shape}"
+                B, C, H, W = x.shape
+                if nbins is None:
+                    nbins = int(min(H, W) // 2)
+
+                # FFT and power (use rfft along width to save work)
+                X = torch.fft.rfft2(x, dim=(-2, -1))              # [B,C,H, W//2+1], complex
+                P = (X.conj() * X).real                           # power, [B,C,H, W//2+1]
+
+                # Radial coordinates for the rfft grid
+                ky = torch.fft.fftfreq(H, d=1.0, device=x.device)     # [-0.5..0.5) cycles/pixel
+                kx = torch.fft.rfftfreq(W, d=1.0, device=x.device)    # [0..0.5]
+                KY, KX = torch.meshgrid(ky, kx, indexing="ij")
+                R = torch.sqrt(KY**2 + KX**2)                         # [H, W//2+1]
+
+                # Bin edges and bin ids
+                rmax = R.max()
+                edges = torch.linspace(0, rmax + 1e-12, nbins + 1, device=x.device)
+                idx = torch.bucketize(R.reshape(-1), edges) - 1       # [H*(W//2+1)], 0..nbins-1
+                idx = idx.clamp_(0, nbins - 1)
+
+                # Sum power per bin (average over B and C after)
+                Pbc = P.reshape(B * C, -1)                            # [(B*C), HWr]
+                idx_bc = idx.unsqueeze(0).expand(B * C, -1)           # match rows
+                num = torch.zeros(B * C, nbins, device=x.device)
+                num.scatter_add_(1, idx_bc, Pbc)
+
+                # Pixel counts per bin (independent of B,C)
+                ones = torch.ones_like(idx, dtype=P.dtype, device=x.device)
+                counts = torch.zeros(nbins, device=x.device)
+                counts.scatter_add_(0, idx, ones)
+                counts = counts.clamp_min(1.0)
+
+                Pr = num / counts                                    # [(B*C), nbins]
+                return Pr.mean(dim=0)                                # [nbins]
+
+            Pr = iso_radial_power(r.detach(), nbins=None) 
+
+            # 2) Sample white and push through CURRENT noise-core (no ŷ, no exp/log)
+            epsn = torch.randn_like(mu_s)
+            eta  = noise_core_fn(epsn) if noise_core_fn is not None else epsn
+
+            Pe = iso_radial_power(eta, nbins=Pr.numel())             # same bin count
+            L_core = F.mse_loss(torch.log(Pe.clamp_min(1e-8)),
+                                torch.log(Pr.clamp_min(1e-8)))
+            
+            w = getattr(self, "noise_core_fit_weight", 0.1)            # add an argparse flag
+            total = total + w * L_core
+            stats["noise_core/L"] = L_core.detach()
+
+
+
+
+
+                
         if getattr(self, "spec_weight", 0.0) > 0.0:
             Ls, La, Lhk = self._spec_loss_pack18(yhat, y,
                                                  margin=getattr(self, "spec_margin", 0.08),
@@ -3465,7 +3594,7 @@ class GroupLossWithQs(GroupLoss):
 
         tuner = None
         # --- MOMENT loss (NLL-consistent, per-pixel, resolution-aligned) ---
-        if getattr(self, "moment_weight", 0.0) > 0.0:
+        if getattr(self, "moment_weight", 0.0) > -1.0: #always on
             if base18 is None:
                 raise RuntimeError("moment_weight>0 but base18 is None. Pass U0 (18-ch) to criterion(...).")
 
@@ -3608,9 +3737,24 @@ class GroupLossWithQs(GroupLoss):
                 S_mu    = _iso_radial_power(mu_step_s.detach(), nbins=spec_bins,
                                             exclude_dc=spec_exclude_dc, window=spec_window)
 
-                white   = vpred.mean(dim=(-2, -1), keepdim=False)             # [B,C]
-                S_noise = white.unsqueeze(-1).expand_as(S_mu)                 # [B,C,K]
+
+                Kbins = max(1, int(getattr(self, "spec_bins", min(Hs, Ws)//2)))
+                spec_exclude_dc  = bool(getattr(self, "spec_exclude_dc", True))
+                spec_window      = bool(getattr(self, "spec_window", False))
+
+                # …compute S_true and S_mu exactly as you already do…
+                
+                white   = vpred.mean(dim=(-2, -1), keepdim=False)            # [B,C]
+                Wk      = self._get_white_shape(Hs, Ws, Kbins, spec_exclude_dc, spec_window,
+                                            device=a_true.device, dtype=a_true.dtype)  # [K]
+                S_noise = white.unsqueeze(-1) * Wk.view(1,1,-1)               # [B,C,K]  <-- calibrated floor
                 S_pred  = S_mu + S_noise
+
+
+                
+                # white   = vpred.mean(dim=(-2, -1), keepdim=False)             # [B,C]
+                # S_noise = white.unsqueeze(-1).expand_as(S_mu)                 # [B,C,K]
+                # S_pred  = S_mu + S_noise
 
                 tau_k      = float(getattr(self, "spec_tau", 0.10))
                 w_over_k   = float(getattr(self, "spec_over_weight", 0.25))
@@ -5086,6 +5230,7 @@ def train(args):
             mono_weight=float(getattr(args,"mono_weight",0.0)),
             qs_slope_weight=float(getattr(args,"qs_slope_weight",0.0)),
             nll_weight = w_nll,
+            sigma_mode = args.sigma_mode,
             current_epoch = epoch, energy_weight = w_energy, energy_grad_weight = w_eg
         ).to(device) 
 
@@ -5202,7 +5347,9 @@ def train(args):
 #                if torch.cuda.is_available(): torch.cuda.synchronize();
 #                t0=time.perf_counter()
 #                #----end-time----
-        
+
+                noise_core_fn = get_noise_core_fn(model)
+                
                 loss, stats, tuner = criterion(
                     yhat, y, base18,
                     dy_scalar=Y_scalar,          # [B]
@@ -5212,7 +5359,8 @@ def train(args):
                     logsig_pred=logsig_pred,
                     drift_pred=mu_pred,         # drift per channel (what head calls μ)
                     y_gate=y_gate,
-                    return_stats=True
+                    return_stats=True,
+                    noise_core_fn=noise_core_fn
                 )
 
 #                #----time----
@@ -5679,7 +5827,8 @@ def train(args):
                     except Exception:
                         y_gate = None
                     
-
+                    noise_core_fn = get_noise_core_fn(model)
+                
                     l, stats_val, tuner = criterion(
                         yh, y, base18,
                         dy_scalar = Y_scalar,
@@ -5689,7 +5838,8 @@ def train(args):
                         logsig_pred = logsig_pred,
                         drift_pred=mu_pred,         # drift per channel (what head calls μ)
                         y_gate = y_gate,
-                        return_stats = True
+                        return_stats = True,
+                        noise_core_fn=noise_core_fn
                     )
 
                 # Collect batch-level slope/mono stats (if present)
@@ -6096,9 +6246,9 @@ def train(args):
                         dy:   [N] array of ΔY
                         edges: bin edges used for your Qs/Q4 stats
                         Returns:
-                        means_per_bin: list of float or nan
-                        counts_per_bin: list of int
-                        combined_rms: float (sqrt of count-weighted mean of bin-means^2)
+                          means_per_bin: list of float or nan
+                          counts_per_bin: list of int
+                          combined_rms: sqrt( count-weighted mean of (bin_mean)^2 )
                         """
                         means, counts = [], []
                         for i in range(len(edges)-1):
@@ -6116,40 +6266,107 @@ def train(args):
                         combined = float(_np.sqrt(num / max(den, 1))) if den > 0 else float("nan")
                         return means, counts, combined
 
+                    # NEW: symmetric error for chi^2
+                    def _sym_log_err(x, floor=1e-8):
+                        # x can be scalar or ndarray; returns |log(x)| with floor to avoid -inf
+                        return _np.abs(_np.log(_np.clip(x, floor, None)))
+
                     # concat the per-sample arrays
-                    fluc_chi2 = _np.concatenate(val_fluc_chi2_all, axis=0) if len(val_fluc_chi2_all) else _np.array([])
-                    spec_relL2 = _np.concatenate(val_spec_relL2_all, axis=0) if len(val_spec_relL2_all) else _np.array([])
-                    fluct_metric = _np.concatenate(val_fluct_metric_all, axis=0) if len(val_fluct_metric_all) else _np.array([])
-                    #dy_vec = _np.concatenate(val_dy_all, axis=0) if len(val_dy_all) else _np.array([])
-                    dy_vec = _np.concatenate(val_dy_tuner_all, axis=0) if len(val_dy_tuner_all) else (_np.concatenate(val_dy_qs_all, axis=0) if len(val_dy_qs_all) else _np.array([]))                    
+                    fluc_chi2     = _np.concatenate(val_fluc_chi2_all, axis=0)     if len(val_fluc_chi2_all)     else _np.array([])
+                    spec_relL2    = _np.concatenate(val_spec_relL2_all, axis=0)    if len(val_spec_relL2_all)    else _np.array([])
+                    fluct_metric  = _np.concatenate(val_fluct_metric_all, axis=0)  if len(val_fluct_metric_all)  else _np.array([])
+                    dy_vec = _np.concatenate(val_dy_tuner_all, axis=0) if len(val_dy_tuner_all) else (
+                             _np.concatenate(val_dy_qs_all, axis=0)    if len(val_dy_qs_all)    else _np.array([]))
+
                     fluc_chi2_bins_mean = []; spec_relL2_bins_mean = []; fluct_metric_bins_mean = []
                     fluct_chi2_err = float("nan"); spec_relL2_err = float("nan"); fluct_metric_err = float("nan")
-                
+
                     if dy_vec.size:
+                        # Per-bin means for display (raw χ² means ~ 1.0 is ideal)
                         if fluc_chi2.size == dy_vec.size:
-                            fluc_chi2_bins_mean, _, fluct_chi2_err = _bin_means_and_weighted_rms(fluc_chi2, dy_vec, edges)
+                            fluc_chi2_bins_mean, _, _ = _bin_means_and_weighted_rms(fluc_chi2, dy_vec, edges)
+                            # Scalar, symmetric "how far from 1" error (lower is better)
+                            _, _, fluct_chi2_err = _bin_means_and_weighted_rms(_sym_log_err(fluc_chi2), dy_vec, edges)
+
+                        # These two already have 0 as "best", so we can keep your existing aggregation
                         if spec_relL2.size == dy_vec.size:
                             spec_relL2_bins_mean, _, spec_relL2_err = _bin_means_and_weighted_rms(spec_relL2, dy_vec, edges)
+
                         if fluct_metric.size == dy_vec.size:
                             fluct_metric_bins_mean, _, fluct_metric_err = _bin_means_and_weighted_rms(fluct_metric, dy_vec, edges)
-                    
 
                     tuner_payload.update({
-                        "fluc_chi2_bins_mean": fluc_chi2_bins_mean,   # per-ΔY-bin means
+                        "fluc_chi2_bins_mean": fluc_chi2_bins_mean,   # per-ΔY-bin raw χ² means (target ≈ 1.0)
                         "spec_relL2_bins_mean": spec_relL2_bins_mean,
                         "fluct_metric_bins_mean": fluct_metric_bins_mean,
-                        
-                        "fluct_chi2_err": float(fluct_chi2_err),      # single scalar
-                        "spec_relL2": float(spec_relL2_err),          # single scalar
-                        "fluct_metric": float(fluct_metric_err),      # single scalar
+
+                        # Scalars (lower is better for all three)
+                        "fluct_chi2_err": float(fluct_chi2_err),      # symmetric err: mean |log χ²|
+                        "spec_relL2": float(spec_relL2_err),
+                        "fluct_metric": float(fluct_metric_err),
                     })
+
+                # if (tuner is not None):
+                #     def _bin_means_and_weighted_rms(vals, dy, edges):
+                #         """
+                #         vals: [N] array, one value per sample
+                #         dy:   [N] array of ΔY
+                #         edges: bin edges used for your Qs/Q4 stats
+                #         Returns:
+                #         means_per_bin: list of float or nan
+                #         counts_per_bin: list of int
+                #         combined_rms: float (sqrt of count-weighted mean of bin-means^2)
+                #         """
+                #         means, counts = [], []
+                #         for i in range(len(edges)-1):
+                #             m = (dy >= edges[i]) & (dy < edges[i+1] if i < len(edges)-2 else dy <= edges[i+1])
+                #             counts.append(int(m.sum()))
+                #             if m.any():
+                #                 means.append(float(_np.nanmean(vals[m])))
+                #             else:
+                #                 means.append(float("nan"))
+                #         num = 0.0; den = 0
+                #         for v, c in zip(means, counts):
+                #             if _np.isfinite(v):
+                #                 num += c * (v*v)
+                #                 den += c
+                #         combined = float(_np.sqrt(num / max(den, 1))) if den > 0 else float("nan")
+                #         return means, counts, combined
+
+                #     # concat the per-sample arrays
+                #     fluc_chi2 = _np.concatenate(val_fluc_chi2_all, axis=0) if len(val_fluc_chi2_all) else _np.array([])
+                #     spec_relL2 = _np.concatenate(val_spec_relL2_all, axis=0) if len(val_spec_relL2_all) else _np.array([])
+                #     fluct_metric = _np.concatenate(val_fluct_metric_all, axis=0) if len(val_fluct_metric_all) else _np.array([])
+                #     #dy_vec = _np.concatenate(val_dy_all, axis=0) if len(val_dy_all) else _np.array([])
+                #     dy_vec = _np.concatenate(val_dy_tuner_all, axis=0) if len(val_dy_tuner_all) else (_np.concatenate(val_dy_qs_all, axis=0) if len(val_dy_qs_all) else _np.array([]))                    
+                #     fluc_chi2_bins_mean = []; spec_relL2_bins_mean = []; fluct_metric_bins_mean = []
+                #     fluct_chi2_err = float("nan"); spec_relL2_err = float("nan"); fluct_metric_err = float("nan")
+                
+                #     if dy_vec.size:
+                #         if fluc_chi2.size == dy_vec.size:
+                #             fluc_chi2_bins_mean, _, fluct_chi2_err = _bin_means_and_weighted_rms(fluc_chi2, dy_vec, edges)
+                #         if spec_relL2.size == dy_vec.size:
+                #             spec_relL2_bins_mean, _, spec_relL2_err = _bin_means_and_weighted_rms(spec_relL2, dy_vec, edges)
+                #         if fluct_metric.size == dy_vec.size:
+                #             fluct_metric_bins_mean, _, fluct_metric_err = _bin_means_and_weighted_rms(fluct_metric, dy_vec, edges)
+                    
+
+                #     tuner_payload.update({
+                #         "fluc_chi2_bins_mean": fluc_chi2_bins_mean,   # per-ΔY-bin means
+                #         "spec_relL2_bins_mean": spec_relL2_bins_mean,
+                #         "fluct_metric_bins_mean": fluct_metric_bins_mean,
+                        
+                #         "fluct_chi2_err": float(fluct_chi2_err),      # single scalar
+                #         "spec_relL2": float(spec_relL2_err),          # single scalar
+                #         "fluct_metric": float(fluct_metric_err),      # single scalar
+                #     })
 
                     # Optional overall scalar that your tuner optimizes
                     w_rmse = 1.0
-                    w_fluc = float(os.getenv("TUNER_W_FLUC", "0.01"))
+                    w_fluc = float(os.getenv("TUNER_W_FLUC", "1."))
                     tuner_payload["tuner_total"] = float(
                         w_rmse * tuner_payload["combined_rmse_total"] +
-                        w_fluc * tuner_payload["fluct_metric"]
+                        w_fluc * tuner_payload["fluct_chi2_err"] #put fluct_metric to include the relL2 term
                     )
                 else:
                     tuner_payload["tuner_total"] = float(
@@ -6366,7 +6583,7 @@ def main():
     ap.add_argument("--energy_grad_weight", type=float, default=0.0,
                     help="Weight for Matching the distribution of gradients.")
     ap.add_argument('--sigma_mode', type=str, default='conv', choices=['diag','conv','spectral'], help='Noise-path covariance: diagonal, local conv operator, or spectral.')
-    ap.add_argument('--noise_kernel', type=int, default=5, help='Kernel size for conv operator σ (odd number).')
+    ap.add_argument('--noise_kernel', type=int, default=9, help='Kernel size for conv operator σ (odd number).')
     
     ap.add_argument("--scheduler", type=str, default="cosine",
                     choices=["cosine","cosine_wr","step","multistep","exponential","plateau","poly","constant"],
