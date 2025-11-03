@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3AA
 # Predict U(Y) and compare to ground truth (trace maps + dipole curves).
 # Safe ckpt loading (PyTorch 2.6), signature-safe model build, and hardened
 # post-processing of predictions (finite replace + adaptive clip + SVD polar).
@@ -15,6 +15,29 @@ import torch.nn.functional as F
 OFFSETS = [(1,0),(0,1),(2,0),(0,2),(4,0),(0,4),(8,0),(0,8),(12,0),(0,12),(16,0),(0,16)]
 QS_THRESHOLD = 0.5
 YCH = 18  # <- set to your Y channel index in the model input
+
+
+def _import_GroupLossWithQs():
+    try:
+        from train_evolver_cuda_opt import GroupLossWithQs
+        return GroupLossWithQs
+    except Exception:
+        import importlib.util, sys
+        candidates = [
+            Path(__file__).with_name("train_evolver_cuda_opt.py"),
+            Path("train_evolver_cuda_opt.py"),
+            Path("/mnt/data/train_evolver_cuda_opt.py"),
+        ]
+        for c in candidates:
+            try:
+                if c.exists():
+                    spec = importlib.util.spec_from_file_location("train_evolver_cuda_opt", str(c))
+                    m = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(m)
+                    return m.GroupLossWithQs
+            except Exception:
+                continue
+        raise
 
 
 # -------- Fourier spectrum utilities --------
@@ -1007,6 +1030,9 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
               float(sigma_raw.mean()), float(sigma_raw.min()), float(sigma_raw.max()))
         print("infer σ_final mean/min/max:",
               float(sigma_final.mean()), float(sigma_final.min()), float(sigma_final.max()))
+
+
+
         
         #     # quick movement check before any projection/repair
     #     try:
@@ -1126,7 +1152,11 @@ def forward_at_Y(x_one: torch.Tensor, Y: float) -> tuple[torch.Tensor, torch.Ten
     # Example possibilities:
     #   Uhat = criterion._pack18_to_U(yhat)
     #   Uhat = su3fix_from_18(yhat)           # <- your function
-    Uhat = su3fix_from_18(yhat)               # <-- CHANGE THIS LINE
+    #Uhat = su3fix_from_18(yhat)               # <-- CHANGE THIS LINE
+    Uhat = GroupLossWithQs._su3_project(
+    GroupLossWithQs._pack18_to_U(yhat)
+    ).squeeze(0).cpu().numpy()  # match training projection
+
     # -------------------------------------------------------------
     return yhat, Uhat
 
@@ -1166,6 +1196,9 @@ def main():
 
     args = ap.parse_args()
 
+
+    GroupLossWithQs = _import_GroupLossWithQs()
+
     # Resolve run dir and manifest
     run_dir = args.runs / (f"run_{int(args.run):05d}" if args.run.isdigit() else args.run)
     man = json.loads((run_dir / "manifest.json").read_text())
@@ -1204,8 +1237,17 @@ def main():
     y_max_data = float(max(y_vals))
     
     # make the model use that normalization
-#    if hasattr(model, "y_min_buf"): model.y_min_buf.fill_(y_min_data)
-#    if hasattr(model, "y_max_buf"): model.y_max_buf.fill_(y_max_data)
+    for mod in (model, getattr(model, "head", None)):
+        if mod is not None:
+            if hasattr(mod, "y_min_buf"): mod.y_min_buf.fill_(y_min_data)
+            if hasattr(mod, "y_max_buf"): mod.y_max_buf.fill_(y_max_data)
+            # (optional, keeps helper logic consistent)
+            if hasattr(mod, "y_min"): mod.y_min = y_min_data
+            if hasattr(mod, "y_max"): mod.y_max = y_max_data
+
+
+    #    if hasattr(model, "y_min_buf"): model.y_min_buf.fill_(y_min_data)
+    #    if hasattr(model, "y_max_buf"): model.y_max_buf.fill_(y_max_data)
     
     print(f"[debug] using y_min={y_min_data:.6g}, y_max={y_max_data:.6g}")
 
@@ -1448,8 +1490,15 @@ def main():
 
     # repair the 18 channels
     y18 = y18_repair(y18_raw)
-    U_pred = pack_to_complex(y18)
-    U_pred = svd_polar_det1(U_pred)  # unitary, det=1
+    # Project using the same helpers as training (torch path)
+    _y18_t = torch.from_numpy(y18).permute(2,0,1).unsqueeze(0).to(device)
+    _U_t   = GroupLossWithQs._su3_project(GroupLossWithQs._pack18_to_U(_y18_t))
+    U_pred = _U_t.squeeze(0).cpu().numpy()  # [N,N,3,3] complex
+
+
+    # y18 = y18_repair(y18_raw)
+    # U_pred = pack_to_complex(y18)
+    # U_pred = svd_polar_det1(U_pred)  # unitary, det=1
     tr_rep = np.trace(U_pred, axis1=-2, axis2=-1) / 3.0
     print(f"Trace repaired: min={tr_rep.real.min():.3e}+{tr_rep.imag.min():.3e}i  "
           f"max={tr_rep.real.max():.3e}+{tr_rep.imag.max():.3e}i")
