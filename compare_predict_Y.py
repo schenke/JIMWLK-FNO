@@ -359,23 +359,26 @@ def _build_evolver_from_ckpt_args(in_ctor, ckpt_args: dict):
     # (use checkpoint values if present; otherwise use safe defaults)
     defaults = {
         "in_ch": 22,
-        "width": 64,
+        "width": ckpt_args.get("width", 64),
         "modes1": ckpt_args.get("modes", 16),
         "modes2": ckpt_args.get("modes", 16),
         "n_blocks": ckpt_args.get("blocks", ckpt_args.get("n_blocks", 6)),
-        # Time conditioning / head parameters
-        "film_mode": "scale_only",
-        "rbf_K": 12,
-        "film_hidden": 64,
-        "gamma_scale": 1.5,
-        "beta_scale": 1.,
-        "gate_temp": 1.0,          # keep training default if absent
-        "y_gain": 1.0,
-        "identity_eps": 0.0,
-        "alpha_scale": 1.0,
-        "clamp_alphas": None,
-        "alpha_vec_cap": 15.0,
-        # propagate Y normalization boundaries
+        "film_mode": ckpt_args.get("film_mode", "scale_only"),
+        "rbf_K": ckpt_args.get("rbf_K", 12),
+        "film_hidden": ckpt_args.get("film_hidden", 64),
+        "gamma_scale": ckpt_args.get("gamma_scale", 1.5),
+        "beta_scale": ckpt_args.get("beta_scale", 1.0),
+        "gate_temp": ckpt_args.get("gate_temp", 1.0),
+        "y_gain": ckpt_args.get("y_gain", 1.0),
+        "identity_eps": ckpt_args.get("identity_eps", 0.0),
+        "alpha_scale": ckpt_args.get("alpha_scale", 1.0),
+        "clamp_alphas": ckpt_args.get("clamp_alphas", None),
+        "alpha_vec_cap": ckpt_args.get("alpha_vec_cap", 15.0),
+        # >>> important for noise <<<
+        "sigma_mode": ckpt_args.get("sigma_mode", "conv"),
+        "spec_bins":  ckpt_args.get("spec_bins", 48),
+        "noise_kernel": ckpt_args.get("noise_kernel", 9),
+        # Y normalization
         "y_min": ckpt_args.get("y_min", 0.0),
         "y_max": ckpt_args.get("y_max", 1.0),
     }
@@ -479,8 +482,48 @@ def _build_evolver_from_ckpt_args(in_ctor, ckpt_args: dict):
 
 
 
+# def safe_load_model(ckpt_path: Path, device: str = "cpu"):
+#     import torch
+#     if "weights_only" in inspect.signature(torch.load).parameters:
+#         try:
+#             from torch.serialization import add_safe_globals
+#             add_safe_globals([pathlib.PosixPath])
+#         except Exception:
+#             pass
+#         try:
+#             ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+#         except Exception:
+#             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+#     else:
+#         ckpt = torch.load(ckpt_path, map_location=device)
+
+#     kwargs = _build_evolver_from_ckpt_args(EvolverFNO.__init__, ckpt["args"])
+#     model = EvolverFNO(**kwargs).to(device)
+#     model.load_state_dict(ckpt["model"], strict=False) #model.load_state_dict(ckpt["model"])
+#     model.eval()
+
+    
+#     # try:
+#     #     ident = getattr(getattr(model, "head", None), "identity_eps", None)
+#     #     ych   = getattr(model, "y_channel", None)
+#     #     print(f"[debug] identity_eps={ident}  y_channel={ych}")
+#     # except Exception:
+#     #     pass
+
+#     # try:
+#     #     head = getattr(model, "head", None)
+#     #     has_su3 = hasattr(head, "lambdas")
+#     #     print(f"[debug] model head: {type(head).__name__ if head is not None else None}  su3_head={has_su3}")
+#     # except Exception:
+#     #     pass
+
+#     return model, ckpt["args"]
+
 def safe_load_model(ckpt_path: Path, device: str = "cpu"):
-    import torch
+    import torch, copy, inspect, pathlib
+    from torch.nn.parameter import UninitializedParameter
+
+    # --- load ckpt (PyTorch 2.6-safe) ---
     if "weights_only" in inspect.signature(torch.load).parameters:
         try:
             from torch.serialization import add_safe_globals
@@ -494,27 +537,57 @@ def safe_load_model(ckpt_path: Path, device: str = "cpu"):
     else:
         ckpt = torch.load(ckpt_path, map_location=device)
 
-    kwargs = _build_evolver_from_ckpt_args(EvolverFNO.__init__, ckpt["args"])
+    # --- build model kwargs from saved args ---
+    kwargs = _build_evolver_from_ckpt_args(EvolverFNO.__init__, ckpt.get("args", {}))
+
+    # If spec_bins wasn't saved, infer it from the spec-head weight shape
+    spec_w_key = "head.spec_head.mlp.3.weight"
+    if "spec_bins" not in kwargs and spec_w_key in ckpt["model"]:
+        kwargs["spec_bins"] = int(ckpt["model"][spec_w_key].shape[0])
+
     model = EvolverFNO(**kwargs).to(device)
-    model.load_state_dict(ckpt["model"], strict=False) #model.load_state_dict(ckpt["model"])
     model.eval()
 
-    
-    # try:
-    #     ident = getattr(getattr(model, "head", None), "identity_eps", None)
-    #     ych   = getattr(model, "y_channel", None)
-    #     print(f"[debug] identity_eps={ident}  y_channel={ych}")
-    # except Exception:
-    #     pass
+    # --- MATERIALIZE lazy params by a dummy forward (critical) ---
+    # Use N from ckpt meta (trainer saves it) with a safe fallback
+    N = int(ckpt.get("meta", {}).get("N", 64))
+    with torch.no_grad():
+        base18  = torch.zeros(1, 18, N, N, device=device)
+        Y_scalar = torch.zeros(1, device=device)
+        theta    = torch.zeros(1, 3, device=device)
+        # a no-op deterministic call (no sampling)
+        _ = model(base18, Y_scalar, theta, sample=False, nsamples=1)
 
-    # try:
-    #     head = getattr(model, "head", None)
-    #     has_su3 = hasattr(head, "lambdas")
-    #     print(f"[debug] model head: {type(head).__name__ if head is not None else None}  su3_head={has_su3}")
-    # except Exception:
-    #     pass
+    # --- drop mismatched tensors before loading (shape-safe) ---
+    state = copy.deepcopy(ckpt["model"])
+    ms = model.state_dict()
+    drop = []
+    for k, v in state.items():
+        if k in ms:
+            try:
+                if ms[k].shape != v.shape:
+                    drop.append(k)
+            except RuntimeError:
+                # If a param still appears uninitialized for any reason,
+                # play it safe and drop the incoming tensor
+                drop.append(k)
+    for k in drop:
+        del state[k]
 
-    return model, ckpt["args"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    model.eval()
+
+    # Optional: push y_min/y_max into buffers if present
+    y_min = ckpt.get("args", {}).get("y_min", None)
+    y_max = ckpt.get("args", {}).get("y_max", None)
+    if (y_min is not None) and (y_max is not None):
+        with torch.no_grad():
+            model.y_min_buf.fill_(float(y_min))
+            model.y_max_buf.fill_(float(y_max))
+
+    return model, ckpt.get("args", {})
+
+
 
 # ---------- robust post-proc ----------
 def finite_frac(Z):
@@ -932,7 +1005,7 @@ def avg_gen_stats(U_pred, Uy_true, U0, Y):
 
 
 # ---------- prediction ----------
-def predict_Uy(model, U0, Y, params, device, sample = False):
+def predict_Uy(model, U0, Y, params, device, sample = True):
     """
     Build [1,22,H,W] input for the model and return raw prediction as numpy [H,W,18].
     - U0: complex ndarray [H,W,3,3] (baseline field)
@@ -1031,6 +1104,12 @@ def predict_Uy(model, U0, Y, params, device, sample = False):
         print("infer σ_final mean/min/max:",
               float(sigma_final.mean()), float(sigma_final.min()), float(sigma_final.max()))
 
+        # yhat, extras = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
+        print("extras keys:", list(extras.keys()) if isinstance(extras, dict) else None)
+        # Optional: check sigma stats
+        if isinstance(extras, dict) and "sigma" in extras:
+            s = extras["sigma"]
+            print("σ mean/min/max:", float(s.mean()), float(s.min()), float(s.max()))
 
 
         
@@ -1192,6 +1271,8 @@ def main():
                     choices=["ReTrU","ImTrU","AbsTrU","ArgTrU"],
                     help="Scalar derived from U for the spectrum")
     ap.add_argument("--fft_bins", type=int, default=64, help="Radial bins for k-spectrum")
+    ap.add_argument("--sigma_mode", choices=["conv","diag","spectral"],
+                    help="Override checkpoint sigma_mode used for sampling noise.")
 
 
     args = ap.parse_args()
@@ -1230,6 +1311,16 @@ def main():
           "identity_eps=", getattr(model.head, "identity_eps", None))
 
     print("ds=",ds)
+
+    core = model.module if hasattr(model, "module") else model
+    if args.sigma_mode:
+        core.sigma_mode = args.sigma_mode
+        if hasattr(core, "head"):
+            core.head.sigma_mode = args.sigma_mode
+    print("[noise] sigma_mode =", getattr(core, "sigma_mode", None),
+          "spec_bins =", getattr(core, "spec_bins", None))
+
+
     
     # compute a reasonable Y range from the run you’re evaluating
     y_vals = [steps_to_Y(int(s["steps"]), ds) for s in man["snapshots"]]
@@ -1342,7 +1433,9 @@ def main():
 
     # Forward once more at Y=0 using the same U0 and params
     y18_raw_0 = predict_Uy(model, U0, 0.0, params, device=device, sample=True)
+    
 
+    
     # Repair non-finite, pack to complex, and project to SU(3)
     Uy_pred = svd_polar_det1(pack_to_complex(y18_repair(y18_raw)))     # at Y*
     U0_pred = svd_polar_det1(pack_to_complex(y18_repair(y18_raw_0)))   # at Y=0

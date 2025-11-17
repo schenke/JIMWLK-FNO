@@ -116,6 +116,35 @@ def dipole_from_links18(links18: torch.Tensor,
 
     return torch.stack(out, dim=1)  # (B, K)
 
+_rfft_bins_cache = {}
+def _get_rfft_bins(H, W, device, n_bins):
+    key = (H, W, device, n_bins)
+    if key in _rfft_bins_cache:
+        return _rfft_bins_cache[key]
+    ky = torch.fft.fftfreq(H, d=1.0, device=device)
+    kx = torch.fft.rfftfreq(W, d=1.0, device=device)
+    rr = torch.sqrt(ky[:, None]**2 + kx[None, :]**2)                 # (H, W//2+1)
+    edges = torch.linspace(rr.min(), rr.max(), n_bins + 1, device=device)
+    bin_index = (torch.bucketize(rr, edges) - 1).clamp_(0, n_bins - 1).to(torch.long)  # (H, W2)
+    counts = torch.bincount(bin_index.view(-1), minlength=n_bins).clamp_min_(1)        # (n_bins,)
+    _rfft_bins_cache[key] = (bin_index, counts)
+    return _rfft_bins_cache[key]
+
+def _psd_bins(resid, bin_index, counts):
+    """
+    resid: (B, C, H, W) real
+    returns: (B, n_bins)
+    """
+    Rk = torch.fft.rfft2(resid, norm='ortho')                         # (B,C,H,W2)
+    P  = (Rk.real**2 + Rk.imag**2).mean(dim=1)                        # avg channels -> (B,H,W2)
+    B, H, W2 = P.shape
+    vals = P.reshape(B, -1)
+    idx  = bin_index.view(-1).unsqueeze(0).expand(B, -1)
+    n_bins = counts.numel()
+    sums = torch.zeros(B, n_bins, device=P.device, dtype=P.dtype)
+    sums.scatter_add_(1, idx, vals)
+    return sums / counts.unsqueeze(0)
+
 def _q4_scalar(U: torch.Tensor, dx1: int, dy1: int, dx2: int, dy2: int) -> torch.Tensor:
     """
     U: [B, H, W, 3, 3] complex
@@ -129,20 +158,20 @@ def _q4_scalar(U: torch.Tensor, dx1: int, dy1: int, dx2: int, dy2: int) -> torch
     tr = torch.einsum('...ij,...kj,...kl,...il->...', Ux, Uy.conj(), Uu, Uv.conj())  # [B,H,W] complex
     return tr.real / 3.0
 
-@torch.no_grad()
-def snapshot_params(module, buf_list=None, dtype=torch.float32):
-    """
-    Make/refresh a device-side snapshot of model params for delta computation.
-    Returns a list of tensors with same shapes/devices as module.parameters().
-    """
-    params = [p.detach() for p in module.parameters() if p.requires_grad]
-    if buf_list is None:
-        # first time: allocate clones
-        return [p.to(dtype).clone() for p in params]
-    # refresh in-place (no reallocation)
-    for buf, p in zip(buf_list, params):
-        buf.copy_(p.to(dtype))
-    return buf_list
+# @torch.no_grad()
+# def snapshot_params(module, buf_list=None, dtype=torch.float32):
+#     """
+#     Make/refresh a device-side snapshot of model params for delta computation.
+#     Returns a list of tensors with same shapes/devices as module.parameters().
+#     """
+#     params = [p.detach() for p in module.parameters() if p.requires_grad]
+#     if buf_list is None:
+#         # first time: allocate clones
+#         return [p.to(dtype).clone() for p in params]
+#     # refresh in-place (no reallocation)
+#     for buf, p in zip(buf_list, params):
+#         buf.copy_(p.to(dtype))
+#     return buf_list
 
 def _iso_radial_power(x: torch.Tensor, nbins: int | None = None,
                       exclude_dc: bool = True, window: bool = False) -> torch.Tensor:
@@ -286,23 +315,23 @@ def compute_curriculum_knobs(epoch: int, args, device):
 
     return rollout_k_curr, float(cons_w), float(sg_w)
 
-# ========= Differentiable radial binning & Qs helpers =========
-def _scatter_mean_1d(src: 'torch.Tensor', index: 'torch.LongTensor', n_bins: int) -> 'torch.Tensor':
-    """
-    Differentiable mean over bins along a flat vector.
-    src:   [N] float tensor (requires grad ok)
-    index: [N] long tensor with values in [0, n_bins-1] (no grad needed)
-    returns: [n_bins] mean per bin (zeros where count==0)
-    """
-    device = src.device
-    sums = torch.zeros(n_bins, device=device, dtype=src.dtype)
-    counts = torch.zeros(n_bins, device=device, dtype=src.dtype)
-    sums = sums.scatter_add(0, index, src)
-    ones = torch.ones_like(src, dtype=src.dtype)
-    counts = counts.scatter_add(0, index, ones)
-    # avoid div by zero
-    out = torch.where(counts > 0, sums / counts.clamp_min(1), torch.zeros_like(sums))
-    return out
+# # ========= Differentiable radial binning & Qs helpers =========
+# def _scatter_mean_1d(src: 'torch.Tensor', index: 'torch.LongTensor', n_bins: int) -> 'torch.Tensor':
+#     """
+#     Differentiable mean over bins along a flat vector.
+#     src:   [N] float tensor (requires grad ok)
+#     index: [N] long tensor with values in [0, n_bins-1] (no grad needed)
+#     returns: [n_bins] mean per bin (zeros where count==0)
+#     """
+#     device = src.device
+#     sums = torch.zeros(n_bins, device=device, dtype=src.dtype)
+#     counts = torch.zeros(n_bins, device=device, dtype=src.dtype)
+#     sums = sums.scatter_add(0, index, src)
+#     ones = torch.ones_like(src, dtype=src.dtype)
+#     counts = counts.scatter_add(0, index, ones)
+#     # avoid div by zero
+#     out = torch.where(counts > 0, sums / counts.clamp_min(1), torch.zeros_like(sums))
+#     return out
 
 # ---- Complex packing helpers ----
 CHANNEL_LAYOUT = "split"
@@ -937,6 +966,26 @@ class TimeConditioner(nn.Module):
             parsed.append((gamma, beta, gate))
         return parsed
 
+class SpecHead(torch.nn.Module):
+    def __init__(self, in_ch, n_bins=48, hidden=128):
+        super().__init__()
+        self.pool = torch.nn.AdaptiveAvgPool2d(1)  # global spatial pooling
+        self.mlp  = torch.nn.Sequential(
+            torch.nn.Flatten(),
+            torch.nn.Linear(in_ch, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, n_bins),
+        )
+    def forward(self, h):                       # h: (B, in_ch, H, W)
+        return self.mlp(self.pool(h))          # (B, n_bins)
+
+def _whiten_per_batch(x: torch.Tensor | None, eps: float = 1e-6):
+    if x is None:
+        return None
+    x = x - x.mean(dim=(1,2,3), keepdim=True)
+    rms = x.pow(2).mean(dim=(1,2,3), keepdim=True).sqrt().clamp_min(eps)
+    return x / rms
+
 class SU3HeadGellMannStochastic(nn.Module):
     """
     Predicts per-unit-Y drift μ and (diag) log-std for 8 (or 16) Lie-algebra coeffs.
@@ -955,6 +1004,7 @@ class SU3HeadGellMannStochastic(nn.Module):
                  alpha_scale: float | None = 1.0,  # optional global scale
                  alpha_vec_cap: float | None = 15.0,
                  A_cap: float | None = None,
+                 spec_bins: int = 48,
                  sigma0: float = 0.03,             # σ init per unit Y
                  sigma_mode: str = "conv",         # "diag" | "conv" | "spectral"
                  noise_kernel: int = 9):
@@ -973,6 +1023,7 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.alpha_vec_cap = alpha_vec_cap
         self.A_cap = A_cap
         self.sigma_mode = sigma_mode
+        self.spec_bins = spec_bins
         
         self.noise_kernel = int(noise_kernel)
         self.width = width
@@ -980,6 +1031,7 @@ class SU3HeadGellMannStochastic(nn.Module):
         # Heads
         self.proj_mu   = nn.Conv2d(width, self.C, kernel_size=1, bias=True)
         self.proj_logs = nn.Conv2d(width, self.C, kernel_size=1, bias=True)
+        self.spec_head  = SpecHead(width, n_bins=self.spec_bins, hidden=128)    
         nn.init.xavier_uniform_(self.proj_mu.weight, gain=1e-2)
         nn.init.constant_(self.proj_mu.bias, 0.0)
         nn.init.constant_(self.proj_logs.weight, 0.0)
@@ -1012,6 +1064,43 @@ class SU3HeadGellMannStochastic(nn.Module):
         self.last_sigma_mean = torch.tensor(0.0)
 
     # ---- helpers ----
+    def _ensure_rfft_bins(self, H, W, device, n_bins):
+    # cache per (H,W,device)
+        if not hasattr(self, "_bins_cache"):
+            self._bins_cache = {}
+        key = (H, W, device)
+        out = self._bins_cache.get(key)
+        if out is not None and out["n_bins"] == n_bins:
+            return out["bin_index"], out["counts"]
+        ky = torch.fft.fftfreq(H, d=1.0, device=device)
+        kx = torch.fft.rfftfreq(W, d=1.0, device=device)
+        rr = torch.sqrt(ky[:, None]**2 + kx[None, :]**2)           # (H, W//2+1)
+        edges = torch.linspace(rr.min(), rr.max(), n_bins + 1, device=device)
+        bin_index = torch.bucketize(rr, edges) - 1                 # Long, [0..n_bins-1]
+        bin_index = bin_index.clamp_(0, n_bins - 1).to(torch.long)
+        counts = torch.bincount(bin_index.view(-1), minlength=n_bins).clamp_min_(1)
+        self._bins_cache[key] = {"bin_index": bin_index, "counts": counts, "n_bins": n_bins}
+        return bin_index, counts
+
+
+    def _synth_from_bins(self, logA_bins, C, H, W, device, zero_dc=True):
+        B = logA_bins.size(0); W2 = W//2 + 1
+        bin_index, _ = self._ensure_rfft_bins(H, W, device, logA_bins.size(1))
+        A_bins  = F.softplus(logA_bins) + 1e-8                        # (B, n_bins)
+        idx     = bin_index.view(-1).unsqueeze(0).expand(B, -1)       # (B, H*W2)
+        A_hw    = torch.gather(A_bins, 1, idx).view(B, H, W2)         # (B, H, W2)
+        if zero_dc:
+            A_hw = A_hw.clone()
+            A_hw[:, 0, 0] = 0.0
+        A_map = A_hw.unsqueeze(1).expand(B, C, H, W2)                 # (B,C,H,W2)
+        z  = torch.randn(B, C, H, W2, dtype=torch.complex64, device=device)
+        Yk = A_map * z
+        eta = torch.fft.irfft2(Yk, s=(H, W), norm="ortho").real
+        den = eta.pow(2).mean(dim=(2,3), keepdim=True).add(1e-12).sqrt().detach()
+        return eta / den
+
+
+    
     def _cap_alphas(self, a: torch.Tensor) -> torch.Tensor:
         if self.clamp_alphas is not None:
             a = torch.tanh(a) * float(self.clamp_alphas)
@@ -1149,47 +1238,6 @@ class SU3HeadGellMannStochastic(nn.Module):
         return eta_core
 
 
-
-    # def _noise_core(self, epsn: torch.Tensor) -> torch.Tensor:
-    #     if self.sigma_mode == "diag":
-    #         eta_core = epsn
-    #     elif self.sigma_mode == "conv":
-    #         eta_core = self.noise_pw(self.noise_dw(epsn))
-    #     else:  # spectral
-    #         B, C, H, W = epsn.shape
-
-    #         # FFT (real-to-complex) → shape [B,C,H,W//2+1]
-    #         Ef = torch.fft.rfft2(epsn, norm="ortho")
-
-    #         # Correct frequency grids: ky uses fftfreq(H), kx uses rfftfreq(W)
-    #         device = epsn.device
-    #         dtype_r = Ef.real.dtype
-
-    #         ky = torch.fft.fftfreq(H, d=1.0, device=device)         # [H]
-    #         kx = torch.fft.rfftfreq(W, d=1.0, device=device)        # [W//2+1]
-    #         KY, KX = torch.meshgrid(ky, kx, indexing="ij")          # [H, W//2+1]
-    #         Kr = torch.sqrt(KX**2 + KY**2).to(dtype_r)              # radial |k|
-
-    #         # Per-channel filter: G(k) = 1 / (1 + (|k|/k0)^p)
-    #         k0 = torch.clamp(self.spec_k0, min=1e-6).view(1, C, 1, 1).to(dtype_r)
-    #         p  = torch.relu(self.spec_p).view(1, C, 1, 1).to(dtype_r)
-
-    #         M = self.spec_a_raw.numel()
-    #         a  = F.softplus(self.spec_a_raw).view(1,1,M,1,1)
-    #         k0 = F.softplus(self.spec_k0_raw).add(1e-6).view(1,1,M,1,1)
-    #         p  = F.softplus(self.spec_p_raw ).add(1e-3).view(1,1,M,1,1)
-    #         Kr = Kr.view(1,1,1,H,W//2+1)
-    #         term = (Kr / k0) ** p                               # [1,1,M,H,Wr]
-    #         G = 1.0 / (1.0 + (a * term).sum(dim=2))             # [1,1,H,Wr]
-    #         G = G.expand(1, C, H, W//2+1)                       # share across C (or learn per-C if needed)
-    #         Ef = Ef * G
-
-    #         eta_core = torch.fft.irfft2(Ef, s=(H, W), norm="ortho")      # [B,C,H,W]
-
-    #     # Normalize per-channel RMS (detach denom so only shape—not amplitude—is learned)
-    #     den = eta_core.pow(2).mean(dim=(2, 3), keepdim=True).add(1e-12).sqrt().detach()
-    #     return eta_core / den
-
     def forward(self,
                 h: torch.Tensor,
                 base18: torch.Tensor,
@@ -1199,6 +1247,7 @@ class SU3HeadGellMannStochastic(nn.Module):
                 sample: bool | None = None,
                 dY: torch.Tensor | None = None,
                 # NEW:
+                detach_sigma_in_spec: bool = False,
                 return_eta: bool = True,
                 eta_stride: int = 1):
         # identity snap at |Y|≈0
@@ -1209,10 +1258,13 @@ class SU3HeadGellMannStochastic(nn.Module):
         device = h.device
 
         # --- build μ, σ, dY as you already do ---
-        mu     = self.proj_mu(h).float()
-        logsig = self.proj_logs(h).float()
+        # --- mean, per-channel sigma, and spectrum bins ---
+        mu         = self.proj_mu(h).float()
+        logsig     = self.proj_logs(h).float()
+        logA_bins  = self.spec_head(h).float()    # (B, spec_bins)
 
-        sigma_min, sigma_max = 1e-4, 0.20
+    
+        sigma_min, sigma_max = 1e-4, 0.01
         sigma = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(logsig)
 
 #        if sample:
@@ -1236,14 +1288,73 @@ class SU3HeadGellMannStochastic(nn.Module):
         mu_step  = mu * dYc
         eta_step  = sigma * torch.sqrt(dYc)
 
-        if sample:
-            epsn_full = torch.randn_like(mu)
-        else:
-            epsn_full = torch.zeros_like(mu)     # <— force ε=0
 
-        #eta_core_full = self._noise_core(epsn_full) if (sample or True) else None
-        eta_core_full = self._noise_core(epsn_full) if sample else None
-        a_all = mu_step + (eta_step * eta_core_full if sample else 0.0)
+        # --------- sampling path (full-res) ----------
+        eta_core_full = None
+        if sample:
+            if self.sigma_mode == "spectral":
+                eta_core_full = self._synth_from_bins(
+                    logA_bins=self.spec_head(h).float(),  # (B, n_bins)
+                    C=mu.size(1), H=H, W=W, device=device
+                )
+            else:
+                epsn_full = torch.randn_like(mu)
+                eta_core_full = self._noise_core(epsn_full)
+
+            # <-- whiten only if we actually have a tensor
+            eta_core_full = _whiten_per_batch(eta_core_full)
+
+        # amplitude
+        eta_amp = sigma * torch.sqrt(dYc)
+        if detach_sigma_in_spec and sample:
+            eta_amp = eta_amp.detach()
+
+        a_all = mu * dYc + (eta_amp * eta_core_full if sample else 0.0)
+
+        # --------- loss/metrics path (downsample optional) ----------
+        eta_core_for_loss = None
+        if return_eta:
+            if self.sigma_mode == "spectral":
+                Hs, Ws = (H // eta_stride, W // eta_stride) if eta_stride > 1 else (H, W)
+                eta_core_for_loss = self._synth_from_bins(
+                    logA_bins=self.spec_head(h).float(),
+                    C=mu.size(1), H=Hs, W=Ws, device=device
+                )
+            else:
+                if eta_stride > 1:
+                    Hs, Ws = H // eta_stride, W // eta_stride
+                    epsn_loss = torch.randn(mu.size(0), mu.size(1), Hs, Ws, device=device, dtype=mu.dtype)
+                else:
+                    epsn_loss = torch.randn_like(mu)
+                eta_core_for_loss = self._noise_core(epsn_loss)
+
+            # <-- whiten here too
+            eta_core_for_loss = _whiten_per_batch(eta_core_for_loss)
+
+
+        # if sample:
+        #     if self.sigma_mode == "spectral":
+        #         # use learned spectrum bins to synthesize k-space noise
+        #         eta_core_full = self._synth_from_bins(
+        #             logA_bins=self.spec_head(h).float(),  # (B, n_bins)
+        #             C=mu.size(1), H=H, W=W, device=device
+        #         )
+        #     else:
+        #         # diag/conv modes keep the original core
+        #         epsn_full = torch.randn_like(mu)
+        #         eta_core_full = self._noise_core(epsn_full)
+        # else:
+        #     eta_core_full = None
+
+        # eta_amp = eta_step
+        # if detach_sigma_in_spec:
+        #     eta_amp = eta_amp.detach()  # block amplitude grads for the spectral sample
+
+        # eta_core_full = eta_core_full - eta_core_full.mean(dim=(1,2,3), keepdim=True)
+        # rms = eta_core_full.pow(2).mean(dim=(1,2,3), keepdim=True).sqrt().clamp_min(1e-6)
+        # eta_core_full = eta_core_full / rms
+
+        # a_all = mu_step + (eta_amp * eta_core_full if sample else 0.0)
 
 
         # mu_step  = mu * dYc
@@ -1262,15 +1373,27 @@ class SU3HeadGellMannStochastic(nn.Module):
         # Do this regardless of `sample` so DDP always sees these params in forward.
         eta_core_for_loss = None
         if return_eta:
-            if eta_stride > 1:
-                Hs, Ws = H // eta_stride, W // eta_stride
-                epsn_loss = torch.randn(B, C, Hs, Ws, device=device, dtype=dtype)
-                eta_core_for_loss = self._noise_core(epsn_loss, stride=eta_stride)  # or however your core downsamples
+            if self.sigma_mode == "spectral":
+                # produce the eta_core deterministically from bins for loss/metrics
+                if eta_stride > 1:
+                    Hs, Ws = H // eta_stride, W // eta_stride
+                    eta_core_for_loss = self._synth_from_bins(
+                        logA_bins=self.spec_head(h).float(), C=mu.size(1), H=Hs, W=Ws, device=device
+                    )
+                else:
+                    eta_core_for_loss = self._synth_from_bins(
+                        logA_bins=self.spec_head(h).float(), C=mu.size(1), H=H, W=W, device=device
+                    )
             else:
-                epsn_loss = torch.randn_like(mu)
+                if eta_stride > 1:
+                    Hs, Ws = H // eta_stride, W // eta_stride
+                    epsn_loss = torch.randn(B, C, Hs, Ws, device=device, dtype=dtype)
+                else:
+                    epsn_loss = torch.randn_like(mu)
                 eta_core_for_loss = self._noise_core(epsn_loss)
-        
-        
+
+
+
 #         if return_eta:
 #             if eta_stride > 1:
 #                 Hs, Ws = H // eta_stride, W // eta_stride
@@ -1317,6 +1440,7 @@ class SU3HeadGellMannStochastic(nn.Module):
 
         extras = {
             "mu": mu, "logsig": logsig, "sigma": sigma,
+            "logA_bins": (self.spec_head(h).float() if hasattr(self, "spec_head") else None),
             "dY": dYt, "alpha_step": a_all.detach(),
         }
         if return_eta and eta_core_for_loss is not None:
@@ -1350,7 +1474,8 @@ class EvolverFNO(nn.Module):
                  gate_temp: float = 2.0,
                  y_min: float | None = None,
                  y_max: float | None = None,
-                 rbf_gamma: float = 0.,
+                 rbf_gamma: float = 1.,
+                 spec_bins: int = 48,
                  rbf_min_width: float = 0.,
                  y_map: str = "linear",
                  sigma_mode: str = "conv",
@@ -1374,7 +1499,7 @@ class EvolverFNO(nn.Module):
         self.lift = nn.Conv2d(18, width, kernel_size=1)
         self.blocks = nn.ModuleList([FNOBlock(width, modes1, modes2) for _ in range(n_blocks)])
         self.block_norm = LayerNorm2d(width)  # pre-norm (channel-only), more stable than GN(1)
-
+        self.spec_bins = spec_bins
         # --- SU(3) head ---
         self.head = SU3HeadGellMannStochastic(
             width,
@@ -1382,14 +1507,15 @@ class EvolverFNO(nn.Module):
             alpha_scale=alpha_scale,
             clamp_alphas=clamp_alphas,
             alpha_vec_cap=alpha_vec_cap,
-            sigma_mode=self.sigma_mode
+            sigma_mode=self.sigma_mode,
+            spec_bins=self.spec_bins
         )
 
         # --- Y & θ embeddings (RBF) ---
         self.time_embed  = RBFEmbed(K=rbf_K, learnable=True, init_sigma=0.20)
         self.theta_embed = RBFEmbed(K=rbf_K, learnable=True, init_sigma=0.20)
 
-        # small “pre-FiLM” MLP to clean embeddings
+        # small "pre-FiLM" MLP to clean embeddings
         self.pre_film = nn.Sequential(
             nn.LazyLinear(self.film_hidden),
             nn.SiLU(),
@@ -1530,6 +1656,7 @@ class EvolverFNO(nn.Module):
                       *,
                       sample: bool | None = None,
                       nsamples: int = 1,
+                      detach_sigma_in_spec: bool = False,
                       dY=None) -> torch.Tensor:
         # Allow accidental (out, extras)
         if isinstance(base18, (tuple, list)):
@@ -1548,17 +1675,17 @@ class EvolverFNO(nn.Module):
             dYmap = dY.to(device=device, dtype=dtype).view(B, 1, 1, 1).expand(B, 1, H, W)
         Ymap = Y_scalar.to(device=device, dtype=dtype).view(B, 1, 1, 1).expand(B, 1, H, W)
 
-        return self.head(h, base18, Ymap, nsamples=nsamples, sample=sample, dY=dYmap)
+        return self.head(h, base18, Ymap, nsamples=nsamples, sample=sample, dY=dYmap, detach_sigma_in_spec=detach_sigma_in_spec)
 
 
-def _reduce(x: torch.Tensor, reduction: str):
-    if reduction == "mean":
-        return x.mean()
-    if reduction == "sum":
-        return x.sum()
-    if reduction == "none":
-        return x
-    raise ValueError(f"Unknown reduction: {reduction}")
+# def _reduce(x: torch.Tensor, reduction: str):
+#     if reduction == "mean":
+#         return x.mean()
+#     if reduction == "sum":
+#         return x.sum()
+#     if reduction == "none":
+#         return x
+#     raise ValueError(f"Unknown reduction: {reduction}")
 
 
 
@@ -2240,7 +2367,9 @@ class GroupLossWithQs(nn.Module):
                 dS_bias=dS_bias
             )
             total = total + self.dipole_weight * dip
-            
+
+
+
             # dip = self._isotropic_dipole_loss(
             #      Uh_q, U_q,
             #      local=False,              # start global (more stable); try True later if you need local
@@ -2359,7 +2488,7 @@ class GroupLossWithQs(nn.Module):
             # drift integrates over ΔY
             mu_step = mu_pred * dY_map  # [B,C,H,W]
     
-            sigma_min, sigma_max = 1e-4, 0.20             # per unit-Y; tune to your system
+            sigma_min, sigma_max = 1e-4, 0.01             # per unit-Y; tune to your system
             raw = logsig_pred
             sigma = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw)
             log_sigma_unit = torch.log(sigma + eps)       # reuse in NLL
@@ -3518,6 +3647,9 @@ def _parse_quad_pairs_list(s: str, dipole_offsets=None):
             seen.add(p); out.append(p)
     return out
 
+def _demean(x):
+    return x - x.mean(dim=(2,3), keepdim=True)
+
 
 def train(args):
     from torch.nn.parallel import DistributedDataParallel as DDP
@@ -3607,12 +3739,11 @@ def train(args):
         y_min=(args.y_min if args.y_min is not None else y_min_data),
         y_max=(args.y_max if args.y_max is not None else y_max_data),
         y_map=args.y_map,
+        spec_bins=args.spec_bins,
         sigma_mode=args.sigma_mode,
         rbf_gamma = getattr(args, "rbf_gamma", 1.0),
         rbf_min_width = getattr(args, "rbf_min_width", 1e-3)
     ).to(device)
-
-
 
     def _has_uninitialized(m):
         for p in m.parameters(recurse=True):
@@ -3620,8 +3751,7 @@ def train(args):
                 return True
         return False
 
-    # move channels_last to after lazy init
-    use_channels_last = getattr(args, "channels_last", True)  # or whatever you use to gate it
+    use_channels_last = getattr(args, "channels_last", True)  
     if use_channels_last:
         try:
             # Fast path if nothing is lazy
@@ -3649,7 +3779,6 @@ def train(args):
             else:
                 raise TypeError(f"Unsupported batch type from train_dl: {type(batch).__name__}")
 
-
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             tb = tb.to(device, non_blocking=True)
@@ -3663,6 +3792,16 @@ def train(args):
         return m.module if isinstance(m, DDP) else m
 
     
+    def spec_head_grad_norm(model):
+        core = unwrap(model)
+        if not hasattr(core, "head") or not hasattr(core.head, "spec_head"):
+            return torch.tensor(0.0, device=next(core.parameters()).device)
+        sq = torch.zeros((), device=next(core.head.spec_head.parameters()).device, dtype=torch.float32)
+        for p in core.head.spec_head.parameters():
+            if p.grad is not None:
+                sq += p.grad.detach().float().pow(2).sum()
+        return sq.sqrt()
+
     mcore = unwrap(model)
     ema = EMA(mcore, decay=args.ema_decay) if args.ema_decay and args.ema_decay>0 else None
     if is_ddp:
@@ -3688,9 +3827,13 @@ def train(args):
     base_params = [p for n,p in model.named_parameters() if p.requires_grad and n not in sched_names]
     fast_params = [p for n,p in model.named_parameters() if p.requires_grad and n in sched_names]
     opt = torch.optim.AdamW(
-        [{"params": trunk, "lr": args.lr, "weight_decay": args.weight_decay},
-         {"params": head,  "lr": args.lr * 4.0, "weight_decay": 0.0}],   # ×4 head LR
-        betas=(0.9, 0.98), eps=1e-8, fused=(device_type == "cuda"))
+        [
+            {"params": trunk, "lr": args.lr, "weight_decay": args.weight_decay},
+            {"params": head,  "lr": args.lr * 4.0, "weight_decay": 0.0}
+        ],  
+        betas=(0.9, 0.98), eps=1e-8, 
+        fused=(device_type == "cuda")
+    )
 
     # ---- LR scheduler (configurable) ----
     w_epochs = max(int(args.warmup_epochs), 0)
@@ -3734,13 +3877,17 @@ def train(args):
     else:
         sched = _build_main_scheduler()
     
+    # Initialize the best validation criterion as infinity
     best = float("inf")
+    # Make sure output directory exists
     os.makedirs(args.out, exist_ok=True)
 
+    # Define logger that only prints on rank 0
     def log(msg: str):
         if (not is_ddp) or dist.get_rank() == 0:
             print(msg, flush=True)
 
+    #Print the device
     if (not is_ddp) or dist.get_rank() == 0:
         print("Device=", device_type)
 
@@ -3817,7 +3964,11 @@ def train(args):
         w_spec_w =  args.spec_whiten_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
         w_spec_g =  args.spec_guard_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
         w_noise_core = args.noise_core_fit_weight * ramp(e, start=E1, duration=max(1,(E2-E1)))
-        w_whiten = 1.0 * ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_whiten = 0.2 * ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_spec_beta   = float(getattr(args, "spec_beta", 0.10))*  ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_spec_smooth = float(getattr(args, "spec_smooth", 1e-3)) * ramp(e, start=E1, duration=max(1,(E2-E1)))
+        w_spec_lambda = float(getattr(args, "spec_lambda", 0.1)) * ramp(e, start=E1, duration=max(1,(E2-E1)))
+
         # Optional cap for the number of quadrupole configs (broader sets can be large)
         max_qp = int(getattr(args, "quad_max_pairs", 0) or 0)
         if max_qp > 0 and len(quad_pairs) > max_qp:
@@ -3833,10 +3984,11 @@ def train(args):
         criterion.spec_whiten_weight = w_spec_w; criterion.noise_core_fit_weight = w_noise_core
         criterion.dipole_slope_weight=w_dip_slope; criterion.qs_weight=w_qs
         criterion.spec_weight=w_spec; criterion.crps_weight=w_crps
-        criterion.moment_weight=w_mom; criterion.spec_whiten_weight=w_spec_w
         criterion.spec_guard_weight=w_spec_g; criterion.nll_weight = w_nll
         criterion.noise_core_fit_weight = w_noise_core
         criterion.energy_weight = w_energy; criterion.energy_grad_weight = w_eg
+
+
 
         # === Full-cov composer & loss feature flags ===
         # Infer alpha channel count (8 or 16) from your head; default to 8.
@@ -3897,134 +4049,293 @@ def train(args):
  #           if torch.cuda.is_available():
  #               e["h2d"][1].record()
 
-            if getattr(args, "channels_last", False) and device_type == "cuda":
-                base18 = base18.contiguous(memory_format=torch.channels_last)
+            if use_channels_last and (device_type == "cuda"):
+                base18 =  base18.contiguous(memory_format=torch.channels_last)
 
             # ---- MC-average DIP / QUAD over K samples (sample=True), using SAME path as criterion ----
             K = getattr(args, "mc_train_K", 1)  # 2 (antithetic) or 4 is plenty
             S_sum = None
             Q4_sum = None
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                for _ in range(K):
-                    yh, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
-                    # Deterministic forward to anchor S(r) on the mean
+#                 #----time----
+#                 if torch.cuda.is_available(): torch.cuda.synchronize();
+#                 t0=time.perf_counter()
+#                 #----end-time----
+#                 for _ in range(K):
+#                     yh, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
+#                     # Deterministic forward to anchor S(r) on the mean
            
-                    Uh = criterion._pack18_to_U(yh)
-                    # match projection behavior used elsewhere
+#                     Uh = criterion._pack18_to_U(yh)
+#                     # match projection behavior used elsewhere
                     
-                    Uh = criterion._su3_project(Uh)
+#                     Uh = criterion._su3_project(Uh)
 
-                    # dipole curve with the SAME offsets the criterion uses
-#                    r, S_k = criterion._dipole_curve(Uh, local=False, assume_su3=True)  # S(r), not N=1-S
-                    S_k = 1.0 - criterion._dipole_curve_from_U(Uh, stride=1)
+#                     # dipole curve with the SAME offsets the criterion uses
+# #                    r, S_k = criterion._dipole_curve(Uh, local=False, assume_su3=True)  # S(r), not N=1-S
+#                     S_k = 1.0 - criterion._dipole_curve_from_U(Uh, stride=1)
                     
-                    # optional: same transform the criterion uses to stabilize large r
-                    # eps = 1e-6
-                    # trans = getattr(criterion, "dipole_transform", "log1mS")
-                    # if trans == "log1mS":
-                    #     S_k = torch.log1p(-S_k.clamp(max=1-eps))
-                    # elif trans == "logS":
-                    #     S_k = torch.log(S_k.clamp(min=eps))
-                    # r-weights (identical to your code’s diagnostics)  
+#                     # optional: same transform the criterion uses to stabilize large r
+#                     # eps = 1e-6
+#                     # trans = getattr(criterion, "dipole_transform", "log1mS")
+#                     # if trans == "log1mS":
+#                     #     S_k = torch.log1p(-S_k.clamp(max=1-eps))
+#                     # elif trans == "logS":
+#                     #     S_k = torch.log(S_k.clamp(min=eps))
+#                     # r-weights (identical to your code’s diagnostics)  
                    
-                    #w_r = r.clamp(min=1.0)  # [K_bins]
+#                     #w_r = r.clamp(min=1.0)  # [K_bins]
 
-                    S_sum = S_k if S_sum is None else (S_sum + S_k)
+#                     S_sum = S_k if S_sum is None else (S_sum + S_k)
 
-                    # quadrupole uses the projected Uh as well
-                    Q4_k = criterion._quadrupole(Uh)  # [B, n_pairs]
-                    Q4_sum = Q4_k if Q4_sum is None else (Q4_sum + Q4_k)
+#                     # quadrupole uses the projected Uh as well
+#                     Q4_k = criterion._quadrupole(Uh)  # [B, n_pairs]
+#                     Q4_sum = Q4_k if Q4_sum is None else (Q4_sum + Q4_k)
 
-                S_mean = S_sum / float(K)   # [B, K_bins] — transformed curve
-                Q4_mean = Q4_sum / float(K) # [B, n_pairs]
+#                 S_mean = S_sum / float(K)   # [B, K_bins] — transformed curve
+#                 Q4_mean = Q4_sum / float(K) # [B, n_pairs]
 
-                # targets through the SAME path
-                Ut = criterion._pack18_to_U(y)
-                Ut = criterion._su3_project(Ut)
-                S_true = criterion._dipole_curve_from_U(Ut, stride=1)
-                #_, S_true = criterion._dipole_curve(Ut, local=False, assume_su3=True)
-                # if trans == "log1mS":
-                #     S_true = torch.log1p(-S_true.clamp(max=1-eps))
-                # elif trans == "logS":
-                #     S_true = torch.log(S_true.clamp(min=eps))
-                Q4_true = criterion._quadrupole(Ut)
+#                 # targets through the SAME path
+#                 Ut = criterion._pack18_to_U(y)
+#                 Ut = criterion._su3_project(Ut)
+#                 S_true = criterion._dipole_curve_from_U(Ut, stride=1)
+#                 #_, S_true = criterion._dipole_curve(Ut, local=False, assume_su3=True)
+#                 # if trans == "log1mS":
+#                 #     S_true = torch.log1p(-S_true.clamp(max=1-eps))
+#                 # elif trans == "logS":
+#                 #     S_true = torch.log(S_true.clamp(min=eps))
+#                 Q4_true = criterion._quadrupole(Ut)
 
-                # losses (weight large r a bit so it doesn’t collapse)
-                #loss_dip  = ((w_r * (S_mean - S_true))**2).mean()
-                # Stable dipole objective (mirrors criterion’s isotropic version)
-                N_pred = 1.0 - S_mean
-                N_true = 1.0 - S_true
+#                 # losses (weight large r a bit so it doesn’t collapse)
+#                 #loss_dip  = ((w_r * (S_mean - S_true))**2).mean()
+#                 # Stable dipole objective (mirrors criterion’s isotropic version)
+#                 N_pred = 1.0 - S_mean
+#                 N_true = 1.0 - S_true
 
          
-                # per-radius normalization to stop trivial global shrink
-                w = 1.0 / N_true.abs().mean(dim=0).clamp_min(1e-3)
-                N_pred = N_pred * w[None, :]
-                N_true = N_true * w[None, :]
+#                 # per-radius normalization to stop trivial global shrink
+#                 w = 1.0 / N_true.abs().mean(dim=0).clamp_min(1e-3)
+#                 N_pred = N_pred * w[None, :]
+#                 N_true = N_true * w[None, :]
 
-                # log-domain comparison
-                eps = 1e-6
-                loss_dip = torch.nn.functional.smooth_l1_loss(
-                    torch.log(N_pred.clamp_min(eps)),
-                    torch.log(N_true.clamp_min(eps)),
-                    beta=0.02
-                )
+#                 # log-domain comparison
+#                 eps = 1e-6
+#                 loss_dip = torch.nn.functional.smooth_l1_loss(
+#                     torch.log(N_pred.clamp_min(eps)),
+#                     torch.log(N_true.clamp_min(eps)),
+#                     beta=0.02
+#                 )
             
-                mid = slice(N_true.shape[1]//8, (N_true.shape[1]*3)//4)  # ignore tiny and Nyquist bins
-                tau = 0.15   # allow 15% headroom
-                over = torch.relu((N_pred - (1.0 + tau) * N_true)[:, mid]).mean()
-                loss_dip = loss_dip + 0.1 * over   # small weight, just a guardrail
+#                 mid = slice(N_true.shape[1]//8, (N_true.shape[1]*3)//4)  # ignore tiny and Nyquist bins
+#                 tau = 0.15   # allow 15% headroom
+#                 over = torch.relu((N_pred - (1.0 + tau) * N_true)[:, mid]).mean()
+#                 loss_dip = loss_dip + 0.1 * over   # small weight, just a guardrail
 
-                loss_quad = torch.nn.functional.mse_loss(Q4_mean, Q4_true)
+#                 loss_quad = torch.nn.functional.mse_loss(Q4_mean, Q4_true)
+
+#                 #----time----
+#                 if torch.cuda.is_available(): torch.cuda.synchronize()
+#                 print(f"[timing] mc dip: {(time.perf_counter()-t0)*1e3:.2f} ms")
+#                 #----end-time----
+
+                # === NEW: sampled reconstruction & spectral penalty (learned spectrum), stable ===
+                K_spec = int(getattr(args, "spec_mc", 2))
+                eps = 1e-6
+
+                # deterministic mean (drift)
+                y_mean, ex_m = model(base18, Y_scalar, theta, sample=False, dY=Y_scalar)
+
+                # local PSD binning
+                _, _, H, W = y_mean.shape
+                bin_index, counts = _get_rfft_bins(H, W, device=base18.device,
+                                                n_bins=int(getattr(args, "spec_bins", 48)))
+
+                # Monte Carlo PSD of residuals from the sampler (detach mean so spec only trains coloring)
+                spec_hat_acc = None
+                for _ in range(K_spec):
+                    yk, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar,
+                                detach_sigma_in_spec=True)  # <- IMPORTANT for stability
+                    rk = _demean(yk - y_mean.detach())
+                    #rk = (yk - y_mean.detach())
+                    psd_k = _psd_bins(rk, bin_index, counts)     # (B, n_bins)
+                    spec_hat_acc = psd_k if spec_hat_acc is None else (spec_hat_acc + psd_k)
+
+                spec_hat = spec_hat_acc / float(K_spec)
+
+                # Target PSD from data residuals (do not backprop into mean/drift here)
+                #rt_data   = (y - y_mean.detach())
+                rt_data = _demean(y  - y_mean.detach())
+                spec_data = _psd_bins(rt_data, bin_index, counts)  # (B, n_bins)
+
+                # If head emits different #bins, align it once here
+                logA_bins = ex_m.get("logA_bins", None)
+                if logA_bins is not None and logA_bins.shape[1] != spec_data.shape[1]:
+                    import torch.nn.functional as F
+                    logA_bins = F.interpolate(
+                        logA_bins.unsqueeze(1), size=spec_data.shape[1],
+                        mode="linear", align_corners=False
+                    ).squeeze(1)  # -> (B, n_bins)
+
+                # Bin weights (match validation): drop Nyquist; same w as val
+                w = counts.to(spec_data.dtype) / counts.max()
+                w = w.view(1, -1).expand_as(spec_data).clone()
+                w[:, -1] = 0.0     # drop Nyquist to mirror validation
+                # (Optional but often helpful) also drop DC:
+                # w[:, 0] = 0.0
+
+                # --- SHAPE term (MATCHES VALIDATION) ---
+                P_h = (w * spec_hat ).sum(dim=1, keepdim=True) + eps
+                P_t = (w * spec_data).sum(dim=1, keepdim=True) + eps
+                spec_hat_n  = spec_hat  / P_h
+                spec_data_n = spec_data / P_t
+                log_diff_shape = torch.log(spec_hat_n + eps) - torch.log(spec_data_n + eps)
+                loss_spec_shape = ((w * (log_diff_shape ** 2)).sum(dim=1) / (w.sum(dim=1) + eps)).mean()
+
+                # --- AMPLITUDE anchor (separate from shape) ---
+                loss_spec_amp = torch.nn.functional.smooth_l1_loss(torch.log(P_h), torch.log(P_t))
+
+                # --- Head supervision (teacher) on bins: teach head the data spectrum in log-space ---
+                if logA_bins is not None:
+                    log_data = torch.log(spec_data + eps).detach()
+                    loss_spec_head = (w * (logA_bins - log_data) ** 2).sum(dim=1).mean()
+                else:
+                    loss_spec_head = torch.zeros((), device=base18.device)
+
+                # --- Smooth the head’s log-spectrum across k-bins (curvature penalty) ---
+                if logA_bins is not None and logA_bins.shape[1] >= 3:
+                    d2 = logA_bins[:, 2:] - 2*logA_bins[:, 1:-1] + logA_bins[:, :-2]
+                    loss_smooth = (d2 ** 2).mean()
+                else:
+                    loss_smooth = torch.zeros((), device=base18.device)
+
+                # --- Optional tiny guard/whiteners (off unless you set weights > 0) ---
+                loss_guard  = torch.zeros((), device=base18.device)
+                loss_whiten = torch.zeros((), device=base18.device)
+                # e.g., if you stash extras["eta_core"], you can keep its RMS ~ 1:
+                # eta_core = ex_m.get("eta_core", None)
+                # if eta_core is not None:
+                #     rms = eta_core.pow(2).mean(dim=(1,2,3)).sqrt()
+                #     loss_whiten = (rms - 1.0).abs().mean()
+
+                # Log the same metric the validator prints (shape-only)
+                meters.add("train/spec_log_rmse",
+                        torch.sqrt((w * (log_diff_shape ** 2)).sum(dim=1) / (w.sum(dim=1) + eps)).mean().detach(),
+                        base18.size(0))
+                meters.add("train/spec_amp_rmse", torch.abs(torch.log(P_h) - torch.log(P_t)).mean().detach(), base18.size(0))
+
+                # Weights from CLI
+                w_spec_beta   = float(getattr(args, "spec_beta",   0.10))
+                w_spec_lambda = float(getattr(args, "spec_lambda", 0.05))
+                w_spec_smooth = float(getattr(args, "spec_smooth", 0.001))
+                w_spec_guard  = float(getattr(args, "spec_guard_weight", 0.0))
+                w_spec_white  = float(getattr(args, "spec_whiten_weight", 0.0))
+
+                loss_spec_total = (
+                    w_spec_beta   * loss_spec_shape
+                    + w_spec_lambda * (loss_spec_amp + 0.5 * loss_spec_head)  # supervise bins lightly
+                    + w_spec_smooth * loss_smooth
+                    + w_spec_guard  * loss_guard
+                    + w_spec_white  * loss_whiten
+                )
 
 
-            # with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-            #     # 1) MC-average DIP / QUAD over K samples (sample=True)
-            #     dip_sum = None
-            #     q4_sum  = None
 
-            #     # Optional: get a base RNG state if you implement antithetic sampling inside the head
-            #     for k in range(K):
-            #         yk, ex_k = model(base18, Y_scalar, theta, sample=True)  # stochastic path
+            #     loss_dip = 0.
+            #     loss_quad = 0.
 
-            #         # DIP: use your helper (same as elsewhere in code)
-            #         Dk = dipole_from_links18(yk, offsets=getattr(args, "sg_dipole_offsets", None))  # [B, ...]
-            #         dip_sum = Dk if dip_sum is None else (dip_sum + Dk)
+            #     # #----time----
+            #     # if torch.cuda.is_available(): torch.cuda.synchronize();
+            #     # t0=time.perf_counter()
+            #     # #----end-time----
 
-            #         # QUAD:
-            #         Uk = criterion._pack18_to_U(yk)
-            #         Q4k = criterion._quadrupole(Uk)  # [B, n_pairs]
-            #         q4_sum = Q4k if q4_sum is None else (q4_sum + Q4k)
+            #     # === NEW: sampled reconstruction & spectral penalty (learned spectrum) ===
+            #     # --- Stable spectral loss (shape + tiny amp), averaged over K samples ---
+            #     K_spec = int(getattr(args, "spec_mc", 2))  # try 4–8
+            #     eps     = 1e-6
 
-            #     dip_mean = dip_sum / float(K)
-            #     q4_mean  = q4_sum  / float(K)
+            #     # deterministic mean (drift)
+            #     y_mean, ex_m = model(base18, Y_scalar, theta, sample=False, dY=Y_scalar)
 
-            #     # Targets from the ground truth
-            #     Dtrue = dipole_from_links18(y, offsets=getattr(args, "sg_dipole_offsets", None))
-            #     Utrue = criterion._pack18_to_U(y)
-            #     Q4true = criterion._quadrupole(Utrue)
+            #     # local PSD binning (no external bin_index/counts)
+            #     _, _, H, W = y_mean.shape
+            #     bin_index, counts = _get_rfft_bins(H, W, device=base18.device,
+            #                                     n_bins=int(getattr(args, "spec_bins", 48)))
+                
+            #     spec_hat_acc = None
+            #     for _ in range(K_spec):
+            #         yk, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar,
+            #                     detach_sigma_in_spec=False)  # <-- implement this flag in your head
+            #         rk = (yk - y_mean.detach())               # <-- detach mean so spec trains only coloring
+            #         psd_k = _psd_bins(rk, bin_index, counts)  # (B, n_bins)
+            #         spec_hat_acc = psd_k if spec_hat_acc is None else (spec_hat_acc + psd_k)
 
-            #     # Observable losses: compare **mean observable** to the true observable
-            #     loss_dip  = torch.nn.functional.mse_loss(dip_mean, Dtrue)
-            #     loss_quad = torch.nn.functional.mse_loss(q4_mean,  Q4true)
+            #     spec_hat = spec_hat_acc / float(K_spec)
+
+            #    # === Target PSD from data residuals (not from the head) ===
+            #     # residuals wrt the deterministic mean (freeze mean path)
+            #     rt_data = (y - y_mean.detach())                            # (B,C,H,W)
+            #     spec_data = _psd_bins(rt_data, bin_index, counts)          # (B, n_bins)
+
+
+
+            #     # optional: align head bins to spec_data bins (if head emits a different count)
+            #     logA_bins = ex_m.get("logA_bins", None)
+            #     if logA_bins is not None and logA_bins.shape[1] != spec_data.shape[1]:
+            #         import torch.nn.functional as F
+            #         logA_bins = F.interpolate(
+            #             logA_bins.unsqueeze(1), size=spec_data.shape[1],
+            #             mode="linear", align_corners=False
+            #         ).squeeze(1)                                           # -> (B, n_bins)
+
+            #     # bin weights (favor low-k) and drop Nyquist
+            #     w = counts.to(spec_data.dtype) / counts.max()
+            #     w = w.view(1, -1).expand_as(spec_data).clone()
+            #     w[:, -1] = 0.0
+
+            #     # --- sampler-to-data shape loss (drives fluctuations toward the data) ---
+            #     log_diff = torch.log(spec_hat + eps) - torch.log(spec_data + eps)        # (B, n_bins)
+            #     loss_spec_shape = (w * (log_diff ** 2)).sum(dim=1).mean()
+
+            #     # --- small amplitude anchor vs data (keeps overall σ identifiable) ---
+            #     P_h = (w * spec_hat).sum(dim=1, keepdim=True)
+            #     P_t = (w * spec_data).sum(dim=1, keepdim=True)
+            #     spec_hat_n = spec_hat / (P_h + eps)
+            #     spec_data_n = spec_data / (P_t + eps)
+            #     log_diff = torch.log(spec_hat_n + eps) - torch.log(spec_data_n + eps)
+                
+            #     loss_spec_amp = torch.nn.functional.smooth_l1_loss(torch.log(P_h + eps),
+            #                                                     torch.log(P_t + eps))
+
+            #     # --- (recommended) supervise head toward data spectrum (teacher signal) ---
+            #     if logA_bins is not None:
+            #         log_data = torch.log(spec_data + eps).detach()
+            #         loss_spec_head = (w * (logA_bins - log_data) ** 2).sum(dim=1).mean()
+            #     else:
+            #         loss_spec_head = torch.zeros((), device=base18.device)
+
+            #     # smoothness on logA bins (unchanged)
+            #     if logA_bins is not None and logA_bins.shape[1] >= 3:
+            #         d2 = logA_bins[:, 2:] - 2*logA_bins[:, 1:-1] + logA_bins[:, :-2]
+            #         loss_smooth = (d2 ** 2).mean()
+            #     else:
+            #         loss_smooth = torch.zeros((), device=base18.device)
+
+            #     # metric
+            #     meters.add("train/spec_log_rmse",
+            #             torch.sqrt(log_diff.pow(2).mean(dim=1)).mean().detach(), base18.size(0))
+
+
+
+                # weights from CLI
+
 
                 # 2) Keep your other terms (CRPS/NLL/spec/energy/qs/…) on a deterministic forward
                 yhat, extras = model(base18, Y_scalar, theta, sample=False)
                 dy_scalar = Y_scalar  # replaces _y_from_batch(x, ...)
      
-
-            #with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                # ##----time----
-                # #if torch.cuda.is_available(): torch.cuda.synchronize();
-                # #t0=time.perf_counter()
-                # ##----end-time----
-                # yhat_single, extras= model(base18, Y_scalar, theta, sample=False)
-                # yhat = yhat_single
-                # dy_scalar = Y_scalar  # replaces _y_from_batch(x, ...)
-
-                ##----time----
-                #if torch.cuda.is_available(): torch.cuda.synchronize()
-                #print(f"[timing] forward: {(time.perf_counter()-t0)*1e3:.2f} ms")
-                ##----end-time----
+                # #----time----
+                # if torch.cuda.is_available(): torch.cuda.synchronize()
+                # print(f"[timing] spec: {(time.perf_counter()-t0)*1e3:.2f} ms")
+                # #----end-time----
 
                 # #----time----
                 # if torch.cuda.is_available(): torch.cuda.synchronize();
@@ -4034,7 +4345,7 @@ def train(args):
                 core = unwrap(model)
 
                 # (optional) if your code still keeps a legacy per-channel sigma head:
-#                logsig_pred = getattr(core.head, "last_y_sigma", None)
+                # logsig_pred = getattr(core.head, "last_y_sigma", None)
                 logsig_pred = extras.get("logsig")
                 #print(logsig_pred)
                 eta_core = extras.get("eta_core")
@@ -4059,11 +4370,15 @@ def train(args):
                 if mu_pred is None or logsig_pred is None:
                     print("[warn] last_mu/logsig missing; NLL will be inactive.")
 
+                # #----time----
+                # if torch.cuda.is_available(): torch.cuda.synchronize()
+                # print(f"[timing] param_nll: {(time.perf_counter()-t0)*1e3:.2f} ms")
+                # #----end-time----
 
-#                #----time----
-#                if torch.cuda.is_available(): torch.cuda.synchronize();
-#                t0=time.perf_counter()
-#                #----end-time----
+                # #----time----
+                # if torch.cuda.is_available(): torch.cuda.synchronize();
+                # t0=time.perf_counter()
+                # #----end-time----
 
                 
                 loss_other, stats, tuner = criterion(
@@ -4079,14 +4394,68 @@ def train(args):
                     eta_core=eta_core
                 )
 
+
+
           
                 # 3) Total loss
-                loss = 0.1 * w_dip * loss_dip + 0.1 * w_quad * loss_quad + loss_other
+                # loss = (
+                #        w_dip * loss_dip
+                #     +  w_quad * loss_quad
+                #     +  loss_other
+                #     +  w_spec_lambda * loss_spec_amp
+                #     +  w_spec_beta   * loss_spec_shape
+                #     +  w_spec_smooth * loss_smooth
+                # )
+                        
+                loss = (
+                + loss_other
+                + loss_spec_total
+                )
+                # loss = (
+                #     w_dip * loss_dip
+                #     +  w_quad * loss_quad
+                #     +  loss_other
+                #     +  w_spec_lambda * (loss_spec_amp + 0.5 * loss_spec_head)  # new: head supervise
+                #     +  w_spec_beta   * loss_spec_shape
+                #     +  w_spec_smooth * loss_smooth
+                # )
 
-#                #----time----
-#                if torch.cuda.is_available(): torch.cuda.synchronize()
-#                print(f"[timing] loss: {(time.perf_counter()-t0)*1e3:.2f} ms")
-#                #----end-time----
+
+                # --- variance calibration for sigma (global amplitude) ---
+                eps = 1e-8
+
+                # 1) Get sigma (or eta_amp) from the model extras
+                sigma = ex_m.get("sigma", None)
+                if sigma is None:
+                    sigma = ex_m.get("eta_amp", None)   # some heads expose eta_amp instead
+
+                
+
+
+                # 2) Compute per-sample teacher variance of residuals
+                axes = tuple(range(1, rt_data.dim()))   # average over C and spatial dims (1D or 2D)
+                v_t = rt_data.pow(2).mean(dim=axes, keepdim=True).detach()   # (B,1,1,...) shape
+
+                # 3) Model-stated variance v_s = σ^2 * ΔY
+                if sigma is not None:
+                    # make ΔY broadcastable
+                    dY = Y_scalar.view(-1, *([1] * (rt_data.dim() - 1)))     # (B,1,1,...) 
+                    v_s = (sigma ** 2) * dY
+
+                    # log-variance match (shape-agnostic, only amplitude)
+                    L_var = (torch.log(v_s + eps) - torch.log(v_t + eps)).pow(2).mean()
+                    loss = loss + 0.1 * L_var   # try 0.02–0.05
+
+                # #----time----
+                # if torch.cuda.is_available(): torch.cuda.synchronize()
+                # print(f"[timing] loss: {(time.perf_counter()-t0)*1e3:.2f} ms")
+                # #----end-time----
+
+                # #----time----
+                # if torch.cuda.is_available(): torch.cuda.synchronize();
+                # t0=time.perf_counter()
+                # #----end-time----
+
                         
                 rollout_k = int(rollout_k_curr)
                 w_state   = float(getattr(args, "rollout_consistency", 0.0))
@@ -4229,7 +4598,17 @@ def train(args):
                 meters.add("train/semigroup_dipole", L_sg_dip.detach(), base18.size(0))
                 meters.add("train/sg_dip_trust_frac", (n_dir > tau).float().mean().detach(), base18.size(0))
 
-                                
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize()
+            # print(f"[timing] sg: {(time.perf_counter()-t0)*1e3:.2f} ms")
+            # #----end-time----
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize();
+            # t0=time.perf_counter()
+            # #----end-time----
+                 
             # ---- accumulation-aware backward/step ----
             accum = int(args.accum)
             loss_unscaled = loss                      # for meters/logging/comparisons
@@ -4239,6 +4618,10 @@ def train(args):
             micro      = (it - 1) % max(1, accum)
             last_micro = (micro == max(1, accum) - 1)
 
+            # inside the training inner loop, after you compute `loss_unscaled`:
+            tr_sum += loss_unscaled.detach().to(tr_sum.dtype)
+            tr_cnt += 1
+
             ddp_ctx = (model.no_sync() if (is_ddp and accum > 1 and not last_micro) else nullcontext())
             with ddp_ctx:
                 if use_amp:
@@ -4246,6 +4629,54 @@ def train(args):
                 else:
                     loss.backward()
                     
+          
+            # if it == 1:
+            #     touched = []
+            #     for n,p in unwrap(model).named_parameters():
+            #         if ("spec" in n or "sigma" in n or "logA" in n) and p.grad is not None and p.grad.norm() > 0:
+            #             touched.append(n)
+            #     print("[debug] spec grads hit:", touched[:6], "..." if len(touched)>6 else "")
+
+            # print("[debug] loss_spec_shape.requires_grad =", loss_spec_shape.requires_grad)
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize()
+            # print(f"[timing] back: {(time.perf_counter()-t0)*1e3:.2f} ms")
+            # #----end-time----
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize();
+            # t0=time.perf_counter()
+            # #----end-time----  
+            
+            # Unscale grads if AMP is on so the numbers are comparable
+            if use_amp and getattr(scaler, "is_enabled", lambda: False)():
+                scaler.unscale_(opt)
+
+            # Compute spec head grad norm
+            gn_spec = spec_head_grad_norm(model)
+
+            # (Optional) reduce to rank 0
+            if is_ddp:
+                gn_spec_all = gn_spec.clone()
+                dist.all_reduce(gn_spec_all, op=dist.ReduceOp.AVG)  # or MAX
+                gn_spec = gn_spec_all
+
+            # Print occasionally
+            if (not is_ddp) or dist.get_rank() == 0:
+                if it == 1 or (it % LOG_EVERY == 0):
+                    print(f"[grad] spec_head ||g||_2 = {gn_spec.item():.3e}")
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize()
+            # print(f"[timing] new spec: {(time.perf_counter()-t0)*1e3:.2f} ms")
+            # #----end-time----
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize();
+            # t0=time.perf_counter()
+            # #----end-time----
+
             # One-off grads diagnostic after a backward happened
             if it == 1:
                 gnorm = _safe_unscale_and_grad_norm(opt, scaler, model)
@@ -4254,6 +4685,7 @@ def train(args):
                     print(f"[grad] unscaled ||g||={gnorm:.3e}  ||g||/||w||={grad_ratio:.3e}")
                 meters.add("grad/norm", gnorm)
                 meters.add("grad/ratio", grad_ratio)
+
 
             if last_micro:  # do the step on every rank
                 core = unwrap(model)
@@ -4286,8 +4718,19 @@ def train(args):
                     else:
                         last_dw_ratio = None  # or keep the tensor if you use it later
 
-        # leftover grads (if epoch ended mid-accum window)
-        if (tr_cnt % max(1, accum)) != 0:
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize()
+            # print(f"[timing] grad diag: {(time.perf_counter()-t0)*1e3:.2f} ms")
+            # #----end-time----
+
+            # #----time----
+            # if torch.cuda.is_available(): torch.cuda.synchronize();
+            # t0=time.perf_counter()
+            # #----end-time----
+
+
+        if last_micro is False and ((it % accum) != 0) and (it == len(train_dl)):
+            # flush pending grads at epoch end
             if use_amp and getattr(scaler, 'is_enabled', lambda: False)():
                 scaler.step(opt); scaler.update()
             else:
@@ -4295,6 +4738,17 @@ def train(args):
             opt.zero_grad(set_to_none=True)
             if ema is not None:
                 ema.update(unwrap(model))
+
+
+        # # leftover grads (if epoch ended mid-accum window)
+        # if (tr_cnt % max(1, accum)) != 0:
+        #     if use_amp and getattr(scaler, 'is_enabled', lambda: False)():
+        #         scaler.step(opt); scaler.update()
+        #     else:
+        #         opt.step()
+        #     opt.zero_grad(set_to_none=True)
+        #     if ema is not None:
+        #         ema.update(unwrap(model))
 
         ybins = _init_ybins()
         nbins = len(ybins)-1
@@ -4376,10 +4830,74 @@ def train(args):
                     yh, extras = model(base18, Y_scalar, theta, sample=False, dY=Y_scalar)
                     dy_scalar = Y_scalar  # [B]
 
+                    # === spectral residual-shape metric (output space, robust) ===
+                    y_mean = yh
+                    y_samp, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
+
+                    B, C_out, H, W = y.shape
+                    n_bins = min(int(getattr(args, "spec_bins", 8)), max(4, min(H, W)//2))
+                    bin_index, counts = _get_rfft_bins(H, W, device=base18.device, n_bins=n_bins)
+
+                    # residuals in the SAME space (18 channels)
+                    
+                    res_true = _demean(y      - y_mean)
+                    res_hat  = _demean(y_samp - y_mean)
+
+                    spec_true = _psd_bins(res_true, bin_index, counts)  # [B, n_bins]
+                    spec_hat  = _psd_bins(res_hat,  bin_index, counts)
+
+                    # floors to avoid log underflow after normalization
+                    eps_rel = 1e-3
+                    spec_true = spec_true + eps_rel * spec_true.mean(dim=1, keepdim=True)
+                    spec_hat  = spec_hat  + eps_rel * spec_hat.mean(dim=1, keepdim=True)
+
+                    # weights: de-bias by counts; drop Nyquist like in train
+                    w = counts.to(spec_true.dtype) / counts.max()
+                    w = w.view(1, -1).expand_as(spec_true).clone()
+                    w[:, -1] = 0.0
+
+                    # normalize per sample → shape-only
+                    P_t = (w * spec_true).sum(dim=1, keepdim=True) + 1e-8
+                    P_h = (w * spec_hat ).sum(dim=1, keepdim=True) + 1e-8
+                    spec_true_n = spec_true / P_t
+                    spec_hat_n  = spec_hat  / P_h
+
+                    # Huber in log-space (prevents blow-ups)
+                    dlog = torch.log(spec_hat_n + 1e-8) - torch.log(spec_true_n + 1e-8)
+                    delta = 2.0
+                    hub = torch.where(dlog.abs() < delta, 0.5*dlog*dlog, delta*(dlog.abs() - 0.5*delta))
+                    spec_log_rmse_per = torch.sqrt((w * hub).sum(dim=1) / (w.sum(dim=1) + 1e-8))
+
+                    meters.add("val/spec_log_rmse", spec_log_rmse_per.mean().detach(), base18.size(0))
+                    val_spec_relL2_all.append(spec_log_rmse_per.detach().cpu().numpy())
+
+                    # (B) amplitude mismatch (optional, mirrors your train term)
+                    spec_amp_rmse_per = torch.abs(torch.log(P_h) - torch.log(P_t)).squeeze(1)
+
+                    
+                    
+                    # y_mean = yh
+                    # y_samp, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
+
+                    # B, C, H, W = y.shape
+                    # bin_index, counts = _get_rfft_bins(H, W, device=base18.device, n_bins=int(getattr(args, "spec_bins", 48)))
+                    # eps = 1e-12
+                    # spec_true = _psd_bins(y - y_mean,   bin_index, counts)     # (B, n_bins)
+                    # spec_hat  = _psd_bins(y_samp - y_mean, bin_index, counts)  # (B, n_bins)
+
+                    # # per-sample log-PSD RMSE across bins
+                    # eps = 1e-6
+                    # spec_log_rmse_per = torch.sqrt(((torch.log(spec_hat + eps) - torch.log(spec_true + eps))**2).mean(dim=1))  # (B,)
+
+                    # accumulate (your arrays already exist)
+                    val_spec_relL2_all.append(spec_log_rmse_per.detach().cpu().numpy())
+                    meters.add("val/spec_log_rmse", spec_log_rmse_per.mean().detach(), base18.size(0))
+
+
                     mu_pred, logsig_pred = None, None
                     if hasattr(model, "param_nll"):
                         #p0 = int(getattr(args, "y_channel", 18)) + 1
-                        Y_final = dy_scalar.to(device).float().view(-1)
+                        Y_final = dy_scalar.to(device).float().view(-1) 
                         mu_unit, sigma_unit, kappa = model.param_nll(theta)
                         muY, sigY = model.param_nll.compose_to_Y(mu_unit, sigma_unit, kappa, Y_final)
                         B, C, H, W = y.shape[0], muY.shape[1], y.shape[-2], y.shape[-1]
@@ -4629,6 +5147,22 @@ def train(args):
 
                 print(f"[val] Qs_disc RMSE={qs_disc_rmse:.4g}  Qs_iso RMSE={qs_iso_rmse:.4g}  dipole_rel_RMSE={dip_rel_rmse:.4g}")
 
+                with torch.no_grad():
+                    sig = extras["sigma"]                      # [B,1,H,W] (or [B,C,H,W])
+                    dYt = extras["dY"]
+                    eta_core = extras.get("eta_core", None)
+                    mu = extras.get("mu", None)
+
+                    sig_mean = sig.mean().item()
+                    amp_rms  = (sig * dYt.sqrt()).pow(2).mean().sqrt().item()
+                    core_rms = float('nan') if eta_core is None else eta_core.pow(2).mean().sqrt().item()
+                    eff_rms  = float('nan') if eta_core is None else ((sig * dYt.sqrt()) * eta_core).pow(2).mean().sqrt().item()
+                    mu_rms   = float('nan') if mu is None else ( (mu * dYt).pow(2).mean().sqrt().item() )
+
+                    print(f"[amp] σ={sig_mean:.4e}  √dY·σ={amp_rms:.4e}  ||core||_rms={core_rms:.3f}  "
+                        f"||η||_rms={eff_rms:.4e}  ||μ·dY||_rms={mu_rms:.4e}")
+
+
                 # ---- Full-cov α-NLL monitor (only if present) ----
                 if "alpha_nll_full" in stats_src:
                     line = (
@@ -4739,6 +5273,16 @@ def train(args):
             print(f"[val Qs(ΔY bins)] edges={edges}  rmse={np.array(rmse_bins)}  mape={np.array(mape_bins)}")
             print(f"[val Qs(ΔY top quartile)] rmse={top_rmse:.3e} mape={top_mape:.3e} "
                   f"Qs_pred_mean={top_pred:.3e} Qs_true_mean={top_true:.3e}")
+
+        if ((not is_ddp) or dist.get_rank() == 0):
+            try:
+                spec_log_rmse_epoch = float(torch.tensor(
+                    np.concatenate(val_spec_relL2_all).reshape(-1)
+                ).mean().item())
+                print(f"[val] spec_log_RMSE={spec_log_rmse_epoch:.4g}")
+            except Exception:
+                pass
+
 
             # ---- Quadrupole RMSE in ΔY quantile bins (matching Qs bins) ----
             try:
@@ -4947,7 +5491,7 @@ def train(args):
             K = 4
             S_sum = 0.0
             for _ in range(K):
-                yk, _ = model(base18, Y_scalar, theta, sample=True)
+                yk, _ = model(base18, Y_scalar, theta, sample=True, dY=Y_scalar)
                 Uk = criterion._pack18_to_U(yk)
                 if not getattr(criterion, "project_before_frob", False): Uk = criterion._su3_project(Uk)
                 r, Sk = criterion._dipole_curve(Uk, local=False, assume_su3=True)
@@ -4989,7 +5533,8 @@ def train(args):
                 "model": state_to_save,
                 "args": {
                     "in_ch": 22, "width": args.width, "modes": args.modes, "blocks": args.blocks,
-                    "proj_iter": 8, "gate_temp": args.gate_temp, "alpha_vec_cap": 15
+                    "proj_iter": 8, "gate_temp": args.gate_temp, "alpha_vec_cap": 15, "spec_bins": args.spec_bins,
+                    "sigma_mode": args.sigma_mode
                 },
                 "meta": {"N": inferred_N, "ds": ds_value, "epoch": epoch, "is_ema": save_ema}
             }
@@ -5158,6 +5703,12 @@ def main():
 
     ap.add_argument("--rbf_gamma", type=float, default=1.0, help="Bias time-embedding centers: <1 packs toward high Y, >1 packs toward low Y")
     ap.add_argument("--rbf_min_width", type=float, default=1e-3, help="Floor for RBF widths in y01 space")
+
+    ap.add_argument('--spec_bins', type=int, default=48)
+    ap.add_argument('--spec_beta', type=float, default=0.10, help='weight on spectral penalty')
+    ap.add_argument('--spec_lambda', type=float, default=0.10, help='weight on spectral penalty') 
+    ap.add_argument('--spec_smooth', type=float, default=1e-3, help='smoothness on logA bins')
+
 
     args = ap.parse_args()
     train(args)
