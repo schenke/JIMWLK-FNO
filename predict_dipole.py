@@ -157,25 +157,42 @@ def load_anchor_info_for_run(data_root: Path, run_id: str) -> Tuple[Dict, int, f
     return man, anchor_steps, float(man["ds"]), str(anchor_path)
 
 
-def select_snapshot_closest_to_Y(man: Dict, anchor_steps: int, Y_target: float) -> Tuple[int, str, float]:
+def select_snapshot_closest_to_Y(man, Y_target, ds_run):
     """
-    Given a manifest, the anchor step count, and Y_target (distance from anchor),
-    pick the snapshot index closest to that Y, returning (idx, path, Y_actual).
+    Given a manifest dict `man` for a single run and a target Y,
+    return (target_idx, rel_path, Y_truth):
+
+      - target_idx : index into man["snapshots"] of the chosen snapshot
+      - rel_path   : the snapshot's path field (usually relative to the run dir)
+      - Y_truth    : the Y value (π² * ds_run * steps)
     """
-    ds = float(man["ds"])
-    best = None
-    for i, s in enumerate(man["snapshots"]):
-        dsteps = int(s["steps"]) - anchor_steps
-        Y_i = dsteps * ds * (math.pi ** 2)
-        if Y_i < 0:
-            continue  # only consider beyond anchor
-        err = abs(Y_i - Y_target)
-        if best is None or err < best[0]:
-            best = (err, i, s["path"], Y_i)
-    if best is None:
-        raise SystemExit("No snapshot beyond anchor to compare against; please provide a positive --Y/--steps.")
-    _, idx, path, Y_actual = best
-    return idx, path, Y_actual
+    snaps = man.get("snapshots", [])
+    if not snaps:
+        raise RuntimeError("No snapshots in manifest.json")
+
+    best_idx = None
+    best_diff = float("inf")
+    best_Y = None
+    best_snap = None
+
+    for i, s in enumerate(snaps):
+        steps_i = int(s["steps"])
+        # same convention as elsewhere: Y = π² * ds_run * steps
+        Y_i = steps_i * ds_run * (math.pi ** 2)
+        diff = abs(Y_i - Y_target)
+        if diff < best_diff:
+            best_diff = diff
+            best_Y = Y_i
+            best_idx = i
+            best_snap = s
+
+    if best_idx is None or best_snap is None:
+        raise RuntimeError("Could not find snapshot closest to desired Y.")
+
+    rel_path = best_snap["path"]
+    return best_idx, rel_path, best_Y
+
+
 
 def build_model(trainer, y_min, y_max, theta_min, theta_max, ckpt_path: Optional[Path], device: torch.device):
     """
@@ -189,6 +206,9 @@ def build_model(trainer, y_min, y_max, theta_min, theta_max, ckpt_path: Optional
     rbf_K = 12
     sigma_mode = "conv"
     spec_bins = 48
+    clamp_alphas = 2.0
+    gamma_scale = 1.5
+    film_hidden = 64
 
     if ckpt_path is not None and ckpt_path.exists():
         chk = torch.load(str(ckpt_path), map_location="cpu")
@@ -202,17 +222,23 @@ def build_model(trainer, y_min, y_max, theta_min, theta_max, ckpt_path: Optional
         state = chk.get("model", chk)
         sigma_mode = argsd.get("sigma_mode", sigma_mode)
         spec_bins=int(argsd.get("spec_bins", spec_bins))
+        clamp_alphas = argsd.get("clamp_alphas", clamp_alphas)
+        gamma_scale = float(argsd.get("gamma_scale", gamma_scale))
+        film_hidden = float(argsd.get("film_hidden", film_hidden))
 
     sd = torch.load(ckpt_path, map_location="cpu")
     state = sd.get("model", sd.get("state_dict", sd))
     hparams = sd.get("hparams", {})  # may be empty on old ckpts
+
+    print("clamp_alphas=", clamp_alphas)
 
     model = trainer.EvolverFNO(
         width=width, modes1=modes, modes2=modes, n_blocks=blocks,
         gate_temp=gate_temp, alpha_vec_cap=alpha_vec_cap,
         y_min=y_min, y_max=y_max, rbf_K=rbf_K,
         theta_min=theta_min.tolist(), theta_max=theta_max.tolist(),
-        sigma_mode=sigma_mode, spec_bins=spec_bins
+        sigma_mode=sigma_mode, spec_bins=spec_bins, clamp_alphas=clamp_alphas,
+        gamma_scale=gamma_scale, film_hidden=film_hidden
     ).to(device).eval()
 
     if state is not None:
@@ -353,6 +379,11 @@ def per_sample_val_metrics(out18_bchw, tgt18_bchw, crit):
             "w": w.detach().cpu().numpy(),  # per-radius weights used by val loss
         }
 
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
 # ------------------------- main -------------------------
 def main():
     ap = argparse.ArgumentParser(description="Predict dipole S(r) and plot center correlator maps (truth vs prediction) for a specific run.")
@@ -414,7 +445,8 @@ def main():
         raise SystemExit(f"Y must be non-negative (got {Y_target}).")
 
     # Pick the truth snapshot closest to Y_target
-    idx_truth, truth_path, Y_truth = select_snapshot_closest_to_Y(man, anchor_steps, Y_target)
+    target_idx, truth_path, Y_truth = select_snapshot_closest_to_Y(man, Y_target, ds_run)
+
     if abs(Y_truth - Y_target) > 1e-8:
         print(f"[info] Truth uses closest Y available in run: requested Y={Y_target:.6g}, actual Y={Y_truth:.6g}")
 
@@ -431,10 +463,80 @@ def main():
     model = build_model(trainer, y_min, y_max, theta_min, theta_max, args.ckpt, device)
 
     # Predict at Y_target
-    y_scalar = torch.tensor([Y_target], dtype=torch.float32, device=device)  # [1]
-    with torch.no_grad():
-        out18, extras = model(base18, y_scalar, theta_vec, sample=True, nsamples=1)
-        U_pred = crit._pack18_to_U(out18)  # -> [B,H,W,3,3] complex64
+    #y_scalar = torch.tensor([Y_target], dtype=torch.float32, device=device)  # [1]
+    # 1. Build a sorted list of snapshots by step number
+    snapshots = man["snapshots"]
+    snapshots_sorted = sorted(snapshots, key=lambda s: int(s["steps"]))
+    steps_sorted = [int(s["steps"]) for s in snapshots_sorted]
+
+    # 2. Find indices for the anchor and the chosen target snapshot
+    #    anchor_steps comes from load_anchor_info_for_run(..)
+    try:
+        anchor_idx = steps_sorted.index(anchor_steps)
+    except ValueError:
+        # Fallback: assume anchor is the very first snapshot
+        anchor_idx = 0
+        anchor_steps = steps_sorted[0]
+
+    # target_idx was returned by select_snapshot_closest_to_Y(..) above,
+    # but that index is into `man["snapshots"]`, not necessarily the
+    # sorted list, so recover the actual step number it refers to:
+    target_steps = int(snapshots[target_idx]["steps"])
+    try:
+        target_idx_sorted = steps_sorted.index(target_steps)
+    except ValueError:
+        raise RuntimeError("Target snapshot steps not found in sorted list.")
+
+    if target_idx_sorted <= anchor_idx:
+        raise RuntimeError("Target snapshot must come after anchor in steps.")
+
+    # 3. Roll forward step-by-step with the learned one-step map
+    U_curr = base18  # [1,18,H,W]
+
+    # if you want to track the rapidity too, start from Y_anchor = 0
+    Y_curr = 0.0
+
+    # store intermediate predictions (after each step)
+    # each entry: {"Y": Y_after_step, "U18": tensor[1,18,H,W]}
+    intermediate = []
+
+    print("anchor= ", anchor_idx, "target= ", target_idx_sorted)
+    for k in range(anchor_idx, target_idx_sorted):
+        step_a = steps_sorted[k]
+        step_b = steps_sorted[k + 1]
+        dsteps = step_b - step_a
+
+        # This matches the training definition: Y = π^2 * ds * steps
+        dY = dsteps * ds_run * (math.pi ** 2)
+        # print("dY=",dY)
+        # print("dsteps=",dsteps)
+        # print("ds_run=",ds_run)
+
+
+        y_step = torch.tensor([dY], dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            U_next, extras = model(
+                U_curr,
+                y_step,
+                theta_vec,
+                sample=True,
+                nsamples=1,
+            )
+
+        U_curr = U_next
+        Y_curr += float(dY)
+
+        # save a detached copy so we can move it to CPU later safely
+        intermediate.append({
+            "Y": Y_curr,
+            "U18": U_curr.detach().clone(),  # [1,18,H,W]
+        })
+
+    # Final prediction at Y_target (≈ Y_truth) is the last state
+    out18 = U_curr
+    U_pred = crit._pack18_to_U(out18)   # [1,H,W,3,3] complex64
+
 
     # Prepare truth Wilson lines as complex
     Ut18_bchw = torch.from_numpy(np.asarray(Ut18)).to(torch.float32).permute(2,0,1).unsqueeze(0).to(device)
@@ -481,8 +583,84 @@ def main():
 
     rid5 = f"{int(args.run):05d}" if str(args.run).isdigit() else str(args.run)
 
+
+    # --- NEW: per-step S(r) and maps from intermediate predictions ---
+
+    step_results = []  # each: {"Y", "r", "S_pred", "S_true", "map_pred", "map_true"}
+
+    with torch.no_grad():
+        for j, item in enumerate(intermediate):
+            Y_step = item["Y"]
+            U18_pred = item["U18"].to(device)          # [1,18,H,W]
+
+            # ---------------- prediction at this step ----------------
+            U_pred_step = crit._pack18_to_U(U18_pred)  # [1,H,W,3,3] complex
+            U_pred_su3_step = crit._su3_project(U_pred_step.to(torch.complex64))
+
+            r_t_pred, S_t_pred = crit._isotropic_curve(
+                U_pred_su3_step,
+                needs_grad=False,
+                assume_su3=True,
+                drop_r0=False,
+            )
+            r_step = to_numpy(r_t_pred)
+            S_pred_step = to_numpy(S_t_pred[0])
+
+            map_pred_step = to_numpy(center_correlator_map(U_pred_su3_step))  # [H,W]
+
+            # ---------------- truth at this step ----------------
+            # The j-th intermediate prediction corresponds to snapshot index (anchor_idx + j + 1)
+            snap_idx = anchor_idx + j + 1
+            snap_true = man["snapshots"][snap_idx]
+            truth_path_step = Path(snap_true["path"])
+
+            Ut18_step = trainer.read_wilson_binary(truth_path_step, size=None)  # [N,N,18]
+            Ut18_bchw_step = (
+                torch.from_numpy(np.asarray(Ut18_step))
+                .to(torch.float32)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device)
+            )
+            U_true_step = crit._pack18_to_U(Ut18_bchw_step)  # [1,H,W,3,3]
+            U_true_su3_step = crit._su3_project(U_true_step.to(torch.complex64))
+
+            r_t_true, S_t_true = crit._isotropic_curve(
+                U_true_su3_step,
+                needs_grad=False,
+                assume_su3=True,
+                drop_r0=False,
+            )
+            # r is the same grid, but we’ll keep it separate for safety
+            r_true_step = to_numpy(r_t_true)
+            S_true_step = to_numpy(S_t_true[0])
+
+            map_true_step = to_numpy(center_correlator_map(U_true_su3_step))
+
+            # ---------------- store everything ----------------
+            step_results.append({
+                "Y": Y_step,
+                "r_pred": r_step,
+                "S_pred": S_pred_step,
+                "r_true": r_true_step,
+                "S_true": S_true_step,
+                "map_pred": map_pred_step,
+                "map_true": map_true_step,
+            })
+
+    print("n intermediate steps:", len(step_results))
+    # Update vmin/vmax to include ALL predicted maps + truth
+    all_maps = [to_numpy(map_true), to_numpy(map_pred)]
+    for s in step_results:
+        all_maps.append(s["map_true"])
+        all_maps.append(s["map_pred"])
+
+    vmin = float(min(m.min() for m in all_maps))
+    vmax = float(max(m.max() for m in all_maps))
+
     # Decide output(s)
     out_path = args.out
+    out_movie = "movie.pdf"
     if out_path.suffix.lower() == ".pdf":
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with PdfPages(out_path) as pdf:
@@ -511,7 +689,12 @@ def main():
             cbar.set_label("C(x) = Re \mathrm{Tr}[U_0 U^\dagger(x,y)]/3$")
             pdf.savefig(fig2)
             plt.close(fig2)
+        
+
+
         print(f"[ok] Wrote multi-page PDF: {out_path}")
+
+
     else:
         # Save S(r) figure to requested path
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,6 +726,67 @@ def main():
             pdf.savefig(fig2)
             plt.close(fig2)
         print(f"[ok] Wrote maps PDF: {maps_pdf}")
+
+
+    # derive a second file name for the movie
+    movie_path = out_path.with_name(out_path.stem + "_movie.pdf")
+    movie_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with PdfPages(movie_path) as pdf_movie:
+        print("adding movie frames for intermediate steps:", len(step_results))
+        for i, s in enumerate(step_results):
+            Y_step        = s["Y"]
+            r_pred_step   = s["r_pred"]
+            S_pred_step   = s["S_pred"]
+            r_true_step   = s["r_true"]
+            S_true_step   = s["S_true"]
+            map_true_step = s["map_true"]
+            map_pred_step = s["map_pred"]
+
+            # 1×3 layout: [S(r), truth map, pred map]
+            # slightly smaller width and height so they sit closer
+            fig, axs = plt.subplots(1, 3, figsize=(11, 3.6))
+
+            # --- S(r): truth + prediction ---
+            axs[0].plot(r_true_step, S_true_step, linestyle='--', label="Truth")
+            axs[0].plot(r_pred_step, S_pred_step, label="Prediction")
+            axs[0].set_xlabel("r (lattice units)")
+            axs[0].set_ylabel("S(r)")
+            axs[0].set_title(f"S(r) @ Y≈{Y_step:.3g}")
+            axs[0].legend(loc="best", fontsize=8)
+
+            # --- maps: truth vs prediction ---
+            im0 = axs[1].imshow(map_true_step, origin="lower", vmin=vmin, vmax=vmax)
+            axs[1].set_title(f"Truth @ Y≈{Y_step:.3g}")
+            axs[1].set_xlabel("x")
+            axs[1].set_ylabel("y")
+
+            im1 = axs[2].imshow(map_pred_step, origin="lower", vmin=vmin, vmax=vmax)
+            axs[2].set_title(f"Pred @ Y≈{Y_step:.3g}")
+            axs[2].set_xlabel("x")
+            axs[2].set_ylabel("y")
+
+            # --- layout tuning BEFORE adding colorbar ---
+            # bring the three axes closer, leave some room on the right for the colorbar
+            fig.subplots_adjust(
+                left=0.07,
+                right=0.90,   # free space on the right for colorbar
+                bottom=0.13,
+                top=0.88,
+                wspace=0.25,  # smaller -> plots closer horizontally
+            )
+
+            # --- dedicated colorbar axis to the right of the maps ---
+            # [x0, y0, width, height] in figure coordinates
+            cbar_ax = fig.add_axes([0.91, 0.15, 0.015, 0.7])
+            cbar = fig.colorbar(im1, cax=cbar_ax)
+            cbar.set_label(r"$C(x) = \mathrm{Re}\,\mathrm{Tr}[U_0 U^\dagger(x,y)]/3$")
+
+            # DO NOT call tight_layout() here; it will shove the colorbar over the plots
+            pdf_movie.savefig(fig)
+            plt.close(fig)
+
+    print(f"[ok] Wrote movie PDF: {movie_path}")
 
 if __name__ == "__main__":
     main()
